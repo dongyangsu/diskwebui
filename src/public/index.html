@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>硬盘检测与格式化 · Web 管理界面 V0.1</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="toprow">
+    <div class="brand">🛠 硬盘检测与格式化 <span class="ver">V0.2</span></div>
+
+    <div class="machine-pick">
+      <label>当前机器</label>
+      <select id="machineSelect"></select>
+      <span id="svcStatus" class="dot off" title="服务状态"></span>
+      <span id="svcText" class="muted">检测中…</span>
+      <span id="curUrl" class="ipurl"></span>
+    </div>
+
+    <div class="topright">
+      <span id="dryBadge" class="badge warn">dryRun 演示</span>
+      <button id="btnPauseAF" class="btn small" title="格完仍有缺陷会自动继续格，可在这里截停">⏸ 暂停自动续格</button>
+      <span id="userBadge" class="badge">—</span>
+      <button id="btnLogout" class="btn small" style="display:none">退出</button>
+    </div>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-view="dash">硬盘</button>
+    <button class="tab" data-view="machines">机器管理</button>
+    <button class="tab" data-view="terminal">命令行</button>
+    <button class="tab" data-view="logs">全局日志</button>
+    <button class="tab" data-view="settings">设置</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ============ 硬盘仪表盘 ============ -->
+  <section id="view-dash" class="view active">
+    <div class="dash">
+      <aside class="col left">
+        <div class="colhead">
+          <b>硬盘列表</b>
+          <span id="diskCount" class="muted"></span>
+          <div class="spacer"></div>
+          <button id="btnScan" class="btn primary small">扫描硬盘</button>
+        </div>
+        <div class="batchbar">
+          <label class="small"><input type="checkbox" id="chkAll"> 全选</label>
+          <span class="muted small" id="selCount">已选 0</span>
+          <div class="spacer"></div>
+          <button class="btn small" id="btnBatchCfg">批量配置</button>
+          <button class="btn small primary" id="btnBatchFormat">批量格式化</button>
+        </div>
+        <div class="filterbar">
+          <input id="fSearch" class="small" placeholder="搜设备/SN/型号">
+          <select id="fDefect" class="small"><option value="">全部缺陷</option><option value="有">有缺陷</option><option value="无">无缺陷</option><option value="未知">未知</option></select>
+          <select id="fBrand" class="small"><option value="">全部品牌</option></select>
+          <select id="fState" class="small"><option value="">全部状态</option><option value="busy">格式化中</option><option value="idle">空闲</option><option value="sys">系统盘</option></select>
+          <button class="btn small" id="btnFilterReset">重置</button>
+        </div>
+        <div id="diskList" class="disklist"></div>
+      </aside>
+
+      <section class="col mid">
+        <div id="detail" class="detail empty">← 左侧选择一块硬盘查看详情</div>
+      </section>
+
+      <aside class="col right">
+        <div class="pane" data-pane="jobs">
+          <div class="colhead panehead"><b>本机正在格式化</b> <span class="muted small" id="jobCount"></span><span class="chev">▾</span></div>
+          <div class="panebody">
+          <div id="jobList" class="joblist muted small">暂无进行中的任务</div>
+          <div id="queueHead" class="muted small" style="padding:4px 14px;display:none">排队队列</div>
+          <div id="queueList" class="joblist muted small"></div>
+        </div>
+        </div>
+        <div class="pane" data-pane="prog">
+          <div class="colhead panehead"><b>选中盘的进度</b><span class="chev">▾</span></div>
+          <div class="panebody"><div id="progressBox" class="progressbox muted">← 左侧选择一块硬盘</div></div>
+        </div>
+        <div class="pane" data-pane="log">
+          <div class="colhead panehead"><b>实时日志</b> <span class="muted" id="logCount"></span><span class="chev">▾</span></div>
+          <div class="panebody"><pre id="liveLog" class="log">等待操作…</pre></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ============ 机器管理 ============ -->
+  <section id="view-machines" class="view">
+    <div class="panel">
+      <h2>机器 IP 列表</h2>
+      <div class="row">
+        <input id="mName" placeholder="名称（可选）">
+        <input id="mIp" placeholder="IP，如 192.168.2.130">
+        <input id="mPort" placeholder="端口" value="8090" style="width:90px">
+        <input id="mRack" placeholder="机房/机架（可选）">
+        <input id="mNote" placeholder="备注（可选）">
+        <button class="btn primary" id="btnAdd">新增机器</button>
+        <button class="btn" id="btnBulk">批量导入…</button>
+        <button class="btn primary" id="btnSync">🔄 同步机器列表</button>
+      </div>
+      <div id="bulkBox" class="hide">
+        <textarea id="bulkText" rows="4" placeholder="粘贴 IP 列表或 CSV，逗号/换行/分号分隔，例如：&#10;192.168.2.130,192.168.2.131,192.168.2.132"></textarea>
+        <button class="btn primary" id="btnBulkGo">导入</button>
+        <button class="btn" id="btnBulkCancel">取消</button>
+      </div>
+      <table class="tbl">
+        <thead><tr><th>名称</th><th>IP</th><th>端口</th><th>状态</th><th>最后检测</th><th>备注</th><th>操作</th></tr></thead>
+        <tbody id="machineRows"></tbody>
+      </table>
+      <p class="muted small">访问方式：<code>http://机器IP:端口</code>；点击「打开页面」直接跳转对应机器的管理界面。</p>
+    </div>
+  </section>
+
+  <!-- ============ 命令行 ============ -->
+  <section id="view-terminal" class="view">
+    <div class="panel termpanel">
+      <div class="termtabs">
+        <div id="termTabBar" class="termtabbar"></div>
+        <button class="btn small" id="btnNewTab">+ 新建标签</button>
+        <button class="btn small" id="btnTermStop">停止命令</button>
+        <label class="small muted">目标机器</label>
+        <select id="termMachine" class="small"></select>
+        <div class="spacer"></div>
+        <label class="small muted">工作目录</label>
+        <input id="termCwd" style="width:230px" placeholder="/home/admin1/hugo-7.4.5.x86_64/">
+        <button class="btn small" id="btnSetCwd">切换</button>
+      </div>
+      <pre id="termOut" class="termout"></pre>
+      <div class="termline">
+        <span id="termPrompt" class="prompt">$</span>
+        <input id="termInput" placeholder="输入命令，回车执行（支持管道/批量；如 seq 4 35 | xargs -I{} -P 0 sudo sg_format -v --format --size=512 /dev/sg{}）">
+        <button class="btn primary" id="btnRun">执行</button>
+      </div>
+      <div class="row">
+        <span class="muted small">快捷：</span>
+        <button class="btn small quick" data-cmd="lsblk -o NAME,SIZE,MODEL,SERIAL,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS">lsblk 盘列表</button>
+        <button class="btn small quick" data-cmd="sudo sg_format -v --format --size=512 /dev/sg2">sg_format 单盘</button>
+        <button class="btn small quick" data-cmd="seq 4 35 | xargs -I{} -P 0 sudo sg_format -v --format --size=512 /dev/sg{}">sg_format 批量</button>
+        <button class="btn small quick" data-cmd="sudo SeaChest_Format_linux_x86_64 -d /dev/sg29 -d /dev/sg30 --setSectorSize 512 --confirm this-will-erase-data-and-may-render-the-drive-inoperable">SeaChest 批量</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 日志 ============ -->
+  <section id="view-logs" class="view">
+    <div class="panel">
+      <div class="row"><h2>操作审计日志</h2><div class="spacer"></div>
+        <button class="btn" id="btnLogsRefresh">刷新</button>
+        <button class="btn" id="btnLogsExport">导出 JSON</button>
+        <select id="logClearMode" class="small"><option value="archive">归档（保留旧日志文件）</option><option value="truncate">直接清空</option></select>
+        <button class="btn danger" id="btnLogsClear">🧹 清理日志</button>
+      </div>
+      <table class="tbl">
+        <thead><tr><th>时间</th><th>类型</th><th>硬盘/命令</th><th>结果</th><th>详情</th></tr></thead>
+        <tbody id="logRows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 设置 ============ -->
+  <section id="view-settings" class="view">
+    <div class="panel">
+      <h2>设置</h2>
+      <div class="grid2">
+        <div>
+          <h3>基本</h3>
+          <label class="f">服务端口 <input id="sPort" type="number"></label>
+          <label class="f">默认格式化逻辑块大小 <input id="sLun" type="number"></label>
+          <label class="f check"><input type="checkbox" id="sDry"> dryRun 演示模式（勾选=只生成命令与日志，不真正执行）</label>
+          <h3>保护规则</h3>
+          <label class="f check"><input type="checkbox" id="sSys"> 系统盘/启动盘默认拦截</label>
+          <label class="f check"><input type="checkbox" id="sMnt"> 已挂载盘默认拦截</label>
+          <label class="f check"><input type="checkbox" id="sUnk"> 缺陷状态未知默认禁止</label>
+        </div>
+        <div>
+          <h3>工具包路径</h3>
+          <div class="row"><button class="btn primary" id="btnDetectTools">🔍 自动检测工具路径</button><span class="muted small" id="detectInfo">各机版本/文件名不同，点一下自动认（hugo / wdckit / SeaChest）</span></div>
+          <label class="f">hugo 目录 <input id="sHugo"> <button class="btn small" data-pick="hugo">📁 浏览…</button></label>
+          <label class="f">hugo 可执行文件 <input id="sHugoBin"></label>
+          <label class="f">wdckit 目录 <input id="sWdckit"> <button class="btn small" data-pick="wdckit">📁 浏览…</button></label>
+          <label class="f">wdckit 可执行文件 <input id="sWdckitBin"></label>
+          <label class="f">SeaChest 目录 <input id="sSea"> <button class="btn small" data-pick="seachest">📁 浏览…</button></label>
+          <label class="f">SeaChest 可执行文件 <input id="sSeaBin"></label>
+          <h3>命令行安全</h3>
+          <label class="f check"><input type="checkbox" id="sConfirm"> 危险命令需二次确认</label>
+          <label class="f">黑名单（逗号分隔） <input id="sBlack"></label>
+          <h3>定时清理（wdckit 日志等会长到几十 G）</h3>
+          <label class="f check"><input type="checkbox" id="cEnabled"> 启用自动清理</label>
+          <label class="f">清理周期：每 <input id="cN" type="number" style="width:70px"> <select id="cU" class="everyunit"></select></label>
+          <label class="f">方式 <select id="cMode"><option value="truncate">清空内容（推荐，工具在写也能立即释放空间）</option><option value="delete">直接删除文件</option></select></label>
+          <label class="f">文件名（逗号分隔，支持 *） <input id="cPatterns" style="width:340px"></label>
+          <div class="row"><button class="btn primary" id="btnCleanNow">🧹 立即清理</button><span class="muted small" id="cleanInfo">—</span></div>
+
+          <h3>机器列表同步（各节点互相同步，收敛成同一份）</h3>
+          <label class="f check"><input type="checkbox" id="syEnabled"> 启用自动同步</label>
+          <label class="f">同步周期：每 <input id="syN" type="number" style="width:70px"> <select id="syU" class="everyunit"></select></label>
+          <div class="muted small" id="syInfo">—</div>
+
+          <h3>硬盘列表自动刷新</h3>
+          <label class="f check"><input type="checkbox" id="drEnabled"> 启用自动刷新（手动刷新 = 硬盘页的「扫描硬盘」按钮）</label>
+          <label class="f">刷新周期：每 <input id="drN" type="number" style="width:70px"> <select id="drU" class="everyunit"></select></label>
+          <div class="muted small" id="drInfo">—</div>
+          <label class="f check"><input type="checkbox" id="hpEnabled"> 热插拔即时检测（插入/拔出硬盘马上感知）</label>
+          <label class="f">检查频率：每 <input id="hpN" type="number" style="width:70px"> <select id="hpU" class="everyunit"></select></label>
+
+          <h3>插盘自动格式化（检测到有缺陷的盘自动排队格式化）</h3>
+          <label class="f check"><input type="checkbox" id="afEnabled"> 启用自动格式化（插盘后自动检测）</label>
+          <label class="f check"><input type="checkbox" id="afOnlyDefect"> 仅对「有缺陷记录」的盘自动格（无缺陷的按规则禁止）</label>
+          <label class="f">检测周期：每 <input id="afN" type="number" style="width:70px"> <select id="afU" class="everyunit"></select></label>
+          <label class="f">同一盘冷却：每 <input id="afCN" type="number" style="width:70px"> <select id="afCU" class="everyunit"></select></label>
+          <label class="f">自动格的逻辑块大小 <input id="afLun" type="number" style="width:110px" placeholder="0=用默认"></label>
+          <div class="muted small" id="afInfo">—</div>
+
+          <h3>版本同步（以主服务器为准，开机自动补齐最新代码）</h3>
+          <label class="f check"><input type="checkbox" id="auEnabled"> 启用自动同步更新（离线机器开机后自动更新）</label>
+          <label class="f check"><input type="checkbox" id="auIdle"> 有格式化任务在跑时先不更新（跑完再更）</label>
+          <label class="f check"><input type="checkbox" id="auTime"> 同时按主服务器校时（东八区北京时间，偏差 &gt;60s 自动校正）</label>
+          <label class="f">检查周期：每 <input id="auN" type="number" style="width:70px"> <select id="auU" class="everyunit"></select></label>
+          <div class="muted small" id="auInfo">—</div>
+          <div class="row"><button class="btn" id="btnAuCheck">立即检查更新</button><span class="muted small" id="auResult"></span></div>
+
+          <h3>高级设置（工具 / 会话 / 保护 / 清理）</h3>
+          <label class="f">hugo 选盘方式：<select id="sHugoPick"><option value="serial">按序列号 -s（精确到单盘，推荐）</option><option value="model">按型号 -m（同型号全格，慎用）</option></select></label>
+          <label class="f">sg_format 批量并发数 <input id="sSgConc" type="number" style="width:90px" placeholder="0=不限"> <span class="muted small">0=不限（文档默认）；建议 2~4 防 HBA 压力</span></label>
+          <label class="f check"><input type="checkbox" id="sSerialize"> 同工具串行排队（<b>默认不勾</b>：每个任务独立进程并行、立即执行；勾选后与前一个同工具任务排队）</label>
+          <label class="f check"><input type="checkbox" id="sRetryRun"> 工具报 “already run” 时自动稍后重试一次</label>
+          <label class="f check"><input type="checkbox" id="sSessOn"> 启用常驻工具会话（界面一直开着；⚠ 天然串行，会影响“立即并行格盘”）</label>
+          <label class="f">工具界面空闲自动 q 退出（秒） <input id="sSessIdle" type="number" style="width:110px" placeholder="600，0=永不退"></label>
+          <label class="f">单个格式化任务超时（秒） <input id="sCmdTo" type="number" style="width:110px"></label>
+          <label class="f">根分区可用低于 <input id="sMinPct" type="number" style="width:70px"> % 或 <input id="sMinMB" type="number" style="width:100px"> MB 时 → 暂停新任务</label>
+          <label class="f check"><input type="checkbox" id="cSysLog"> 自动清理系统日志（kern.log / syslog 超限截断）</label>
+          <label class="f">系统日志单文件上限 <input id="cSysMB" type="number" style="width:110px"> MB</label>
+          <label class="f">任务日志保留最多 <input id="sLogKeep" type="number" style="width:90px"> 个（旧的自动删）</label>
+          <label class="f">打印机队列名 <input id="sPrinter" style="width:200px" placeholder="HP_M1522nf"></label>
+          <label class="f">标签输出目录 <input id="sLabelDir" style="width:280px" placeholder="（空=程序 data/labels）"></label>
+          <div class="muted small" id="advInfo">—</div>
+          <div class="row">
+            <button class="btn danger" id="btnStopAll">⏹ 全部停止任务</button>
+            <button class="btn" id="btnBackup">💾 备份配置数据</button>
+            <button class="btn" id="btnRestore">↩ 恢复最近备份</button>
+            <button class="btn" id="btnCert">🔐 检查/续期 HTTPS 证书</button>
+            <button class="btn" id="btnPurge">🧹 清空历史/日志</button>
+            <span class="muted small" id="opsResult"></span>
+          </div>
+        </div>
+      </div>
+      <div class="row"><button class="btn primary" id="btnSaveSettings">保存设置</button><span id="saveInfo" class="muted"></span></div>
+      <h3>格式化历史（可导出 CSV）</h3>
+      <div class="row"><button class="btn" id="btnHistRefresh">刷新</button><button class="btn primary" id="btnHistCsv">导出 CSV</button><span class="muted small" id="histInfo"></span></div>
+      <div style="max-height:320px;overflow:auto">
+        <table class="tbl"><thead><tr><th>时间</th><th>设备</th><th>SN</th><th>品牌</th><th>工具</th><th>逻辑块</th><th>轮次</th><th>状态</th><th>耗时</th></tr></thead><tbody id="histRows"></tbody></table>
+      </div>
+      <h3>格式化工具与命令模板</h3>
+      <table class="tbl"><thead><tr><th>工具</th><th>品牌</th><th>接口</th><th>命令模板</th><th>支持的逻辑块大小</th><th>说明</th></tr></thead><tbody id="toolRows"></tbody></table>
+      <h3>已保存的格式化模板（不含文件系统/分区表）</h3>
+      <table class="tbl"><thead><tr><th>品牌</th><th>接口</th><th>工具</th><th>模式</th><th>逻辑块大小</th><th>保存时间</th><th>操作</th></tr></thead><tbody id="tplRows"></tbody></table>
+
+      <h3>账号与权限（增 / 删 / 改 / 查；三级：viewer 只看 / operator 可格式化 / admin 可命令行+设置）</h3>
+      <div class="row">
+        <input id="uq" placeholder="搜索用户名…" style="min-width:160px">
+        <select id="uRoleFilter"><option value="">全部角色</option><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
+        <button class="btn" id="btnUserSearch">查询</button>
+        <button class="btn" id="btnUserReset">重置</button>
+        <div class="spacer"></div>
+        <span class="muted small" id="userCount"></span>
+      </div>
+      <table class="tbl"><thead><tr><th>用户名</th><th>角色</th><th>操作</th></tr></thead><tbody id="userRows"></tbody></table>
+      <h3>新增账号</h3>
+      <div class="row">
+        <input id="uName" placeholder="用户名">
+        <input id="uPass" type="password" placeholder="密码（≥４位）">
+        <select id="uRole"><option value="viewer">viewer（只看）</option><option value="operator">operator（可格式化）</option><option value="admin">admin（全部）</option></select>
+        <button class="btn primary" id="btnAddUser">新增账号</button>
+      </div>
+      <div class="row">
+        <span class="muted small">修改我自己的密码：</span>
+        <input id="pwOld" type="password" placeholder="原密码">
+        <input id="pwNew" type="password" placeholder="新密码（≥４位）">
+        <button class="btn" id="btnChangePw">修改密码</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ 顶部命令行抽屉 ============ -->
+<div id="dock" class="dock collapsed">
+  <div class="dockhead" id="dockHead">
+    <b>⌨ 命令行（多开/多标签）</b>
+    <span id="dockStatus" class="muted small"></span>
+    <div class="spacer"></div>
+    <button class="btn small" id="dockToggle">展开 ▲</button>
+  </div>
+  <div class="dockbody">
+    <div class="termtabbar" id="dockTabs"></div>
+    <pre id="dockOut" class="termout small"></pre>
+    <div class="termline">
+      <span class="prompt">$</span>
+      <input id="dockInput" placeholder="示例：usb 路径下调用 hugo 内的 format…">
+      <button class="btn primary small" id="dockRun">执行</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 格式化二次确认 ============ -->
+<div id="confirmModal" class="modal hide">
+  <div class="dialog">
+    <div class="row"><h2 style="margin:0">⚠️ 格式化确认</h2><div class="spacer"></div><button class="btn" id="confirmX" title="关闭">✕ 关闭</button></div>
+    <table class="tbl small" id="confirmTable"></table>
+    <div class="cmdpreview"><div class="muted small">将执行的命令</div><pre id="confirmCmd"></pre><div class="muted small" id="confirmCwd"></div></div>
+    <label class="check big"><input type="checkbox" id="confirmChk"> 我确认此操作将擦除硬盘数据，并可能导致硬盘不可用</label>
+    <div class="row right">
+      <button class="btn" id="confirmCancel">取消</button>
+      <button class="btn danger" id="confirmGo" disabled>开始格式化</button>
+    </div>
+    <div id="confirmWarn" class="warnbox hide"></div>
+  </div>
+</div>
+
+<!-- ============ 通用确认/输入弹窗（替代原生 confirm()/prompt()）============ -->
+<div id="askModal" class="modal hide">
+  <div class="dialog" style="width:460px">
+    <h2 id="askTitle" style="margin:0 0 10px">确认</h2>
+    <div id="askMsg" style="white-space:pre-wrap;line-height:1.7"></div>
+    <label class="f hide" id="askInputWrap" style="margin-top:10px">输入 <input id="askInput"></label>
+    <div class="row right" style="margin-top:14px">
+      <button class="btn" id="askNo">取消</button>
+      <button class="btn danger" id="askYes">确定</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hide"></div>
+
+<!-- ============ 登录 ============ -->
+<div id="loginModal" class="modal hide">
+  <div class="dialog" style="width:420px">
+    <h2>🔐 登录</h2>
+    <label class="f">用户名 <input id="lgUser" placeholder="admin"></label>
+    <label class="f">密码 <input id="lgPass" type="password" placeholder="密码"></label>
+    <div class="row right"><button class="btn primary" id="lgGo">登录</button></div>
+    <div id="lgErr" class="warnbox hide"></div>
+    <p class="muted small">权限分三级：viewer（只看）/ operator（可格式化）/ admin（可命令行与设置）。</p>
+  </div>
+</div>
+
+<!-- 登录页（登录进去才显示主页面；用户 2026-09-17 要求） -->
+<section id="loginPage" class="loginpage">
+  <div class="loginbox">
+    <div class="login-left">
+      <div class="llogo">🛠</div>
+      <h1>硬盘检测与格式化</h1>
+      <div class="lsub">Disk Detect &amp; Format Console</div>
+      <ul class="lfeat">
+        <li>自动识别品牌 / 接口 / 逻辑块大小 / 512e·4Kn</li>
+        <li>SAS G-list、SATA 05/196/197/198/199 缺陷判定</li>
+        <li>检测到缺陷自动排队格式化・完成后自动复检续轮</li>
+        <li>多机统一管理・版本与时间自动同步</li>
+      </ul>
+      <div class="lver">V0.2</div>
+    </div>
+    <div class="login-right">
+      <h2>用户登录</h2>
+      <div class="lhost" id="loginHost">—</div>
+      <label class="f"><span>用户名</span><input id="lgUser2" placeholder="请输入用户名" autocomplete="username"></label>
+      <label class="f"><span>密码</span>
+        <span class="pw"><input id="lgPass2" type="password" placeholder="请输入密码" autocomplete="current-password"><button type="button" id="lgEye" title="显示/隐藏密码">👁</button></span>
+      </label>
+      <div id="lgErr2" class="warnbox hide"></div>
+      <button class="btn primary big" id="lgGo2">登 录</button>
+      <div class="lfoot muted small">硬盘检测与格式化控制台 · 本地部署</div>
+    </div>
+  </div>
+</section>
+<script src="app.js"></script>
+</body>
+</html>
