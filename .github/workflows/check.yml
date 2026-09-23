@@ -1,0 +1,26 @@
+name: check
+
+on:
+  push:
+    branches: [ webproject ]
+  pull_request:
+    branches: [ webproject ]
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    name: 语法自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: node --check 全部 JS
+        run: |
+          set -e
+          for f in src/server.js src/lib/*.js src/public/app.js; do
+            echo "检查 $f"
+            node --check "$f"
+          done
+          echo "全部通过 ✅"
