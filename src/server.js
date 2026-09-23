@@ -162,17 +162,13 @@ async function remoteJson(machine, tail, method, body, query) {
 }
 
 const PUBLIC = path.join(__dirname, 'public');
-const VERSION = '0.2.0';
-/* 构建指纹：用于节点间比对代码版本（自动同步更新用） */
-function computeBuild() {
-  const list = ['server.js'];
-  for (const d of ['lib', 'public']) { try { for (const f of fs.readdirSync(path.join(__dirname, d)).sort()) list.push(d + '/' + f); } catch (e) {} }
-  const h = crypto.createHash('md5');
-  h.update(VERSION);
-  for (const f of list) { try { h.update(fs.readFileSync(path.join(__dirname, f))); } catch (e) {} }
-  return h.digest('hex').slice(0, 12);
-}
-const BUILD = computeBuild();
+const VERSION = '0.3.0';
+/* 构建指纹：统一走 lib/build.js 的 compute()（只算固定清单，不含 .bak 等野文件）。
+   2026-09-23 修复：此前这里用 readdirSync 把 lib/ 下所有文件（含 .bak 备份）都算进指纹，
+   与 lib/build.js compute() 的口径不一致 → 节点与主源 build 永远不相等 →
+   每 5 分钟无限"更新一次 + 重启服务"。现两处共用同一算法。 */
+const build = require('./lib/build');
+const BUILD = build.compute(__dirname);
 let settings = store.load('settings');
 /* 服务以 root 跑时 HOME=/root，而工具包在普通用户家目录下 → 自动定位并记住 */
 if (!settings.homeDir) {
@@ -527,7 +523,7 @@ async function getDisks(force) {
 /* ---------- 路由 ---------- */
 const handler = async (req, res) => {
   const u = url.parse(req.url, true);
-  const p = u.pathname;
+  let p = u.pathname;
   const m = req.method;
 
   /* 静态资源 */
@@ -599,6 +595,22 @@ const handler = async (req, res) => {
   }
 
   try {
+    /* 2026-09-22 修复（用户："点击对应机器就应该显示对应机器"）：机器作用域通用透传。
+       原来只有 disks / autoformat / jobs / formatting / terminal 是按机器走的，
+       settings / logs / users / tools / templates / space / history / clean / ops 等
+       一律打在本机 → 选中别的机器时这些页面还是本机的数据（或 404）。
+       现统一：/api/v1/machines/<mid>/<rest>
+         · mid=local  → 改写成 /api/v1/<rest>，走下面原有处理（同机同逻辑）
+         · mid=远端   → 代理到该机器的 /api/v1/<rest>
+       下面这几个已有专门处理的路径不走这里（保持原样）：disks|autoformat|jobs|formatting|terminal */
+    let mmScope = p.match(/^\/api\/v1\/machines\/([^/]+)\/(?!disks|autoformat|jobs|formatting|terminal)(.+)$/);
+    if (mmScope) {
+      const mScope = findMachine(mmScope[1]);
+      if (!mScope) return json(res, 404, { error: '机器不存在' });
+      if (mScope.local) p = '/api/v1/' + mmScope[2];
+      else return proxy(mScope, req, res, '/api/v1/' + mmScope[2], m, body, u.query);
+    }
+
     /* 健康检查 / 本机信息 */
     if (p === '/api/v1/health' && m === 'GET') {
       return json(res, 200, { ok: true, version: VERSION, build: BUILD, hostname: os.hostname(), ips: localIPs(), port: settings.nodePort, httpsPort: settings.httpsPort || 8443, httpsEnabled: settings.httpsEnabled !== false, uptime: process.uptime(), dryRun: settings.dryRun });
@@ -610,7 +622,7 @@ const handler = async (req, res) => {
     /* 代码包（tar.gz，排除 data/tls）：节点自动更新时拉取 */
     if (p === '/api/v1/bundle' && m === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Disposition': 'attachment; filename="disk_webui_bundle.tar.gz"', 'Cache-Control': 'no-store', 'X-Build': BUILD });
-      const t = require('child_process').spawn('tar', ['czf', '-', '-C', __dirname, '--exclude=data', '--exclude=tls', '--exclude=*.bak', '.']);
+      const t = require('child_process').spawn('tar', ['czf', '-', '-C', __dirname, '--exclude=data', '--exclude=tls', '--exclude=*.bak', '--exclude=*.bak*', '.']);
       t.stdout.pipe(res);
       t.on('error', () => { try { res.end(); } catch (e) {} });
       t.on('close', () => { try { res.end(); } catch (e) {} });
@@ -745,6 +757,14 @@ const handler = async (req, res) => {
     if (p === '/api/v1/history' && m === 'GET') {
       const lim = Math.min(5000, Math.max(1, Number(u.query.limit) || 300));
       return json(res, 200, { history: store.readJSONL('format-history.jsonl', lim), total: store.readJSONL('format-history.jsonl', 100000).length });
+    }
+    /* 2026-09-22（用户要求）：清空格式化历史（在“格式化历史”旁边放按钮） */
+    if (p === '/api/v1/history/clear' && m === 'POST') {
+      const before = store.readJSONL('format-history.jsonl', 100000).length;
+      try { fs.writeFileSync(path.join(__dirname, 'data', 'format-history.jsonl'), ''); }
+      catch (e) { return json(res, 500, { error: '清空失败：' + e.message }); }
+      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'history-clear', before, by: req.user && req.user.user });
+      return json(res, 200, { ok: true, cleared: before });
     }
     if (p === '/api/v1/history.csv' && m === 'GET') {
       const rows = store.readJSONL('format-history.jsonl', 100000).reverse();
@@ -913,8 +933,12 @@ const handler = async (req, res) => {
         stopSerials: want ? (cur0.stopSerials || []) : [],
       });
       store.save('settings', settings);
-      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-pause', paused: want, clearedStopSerials: cleared, by: req.user && req.user.user });
-      return json(res, 200, { ok: true, paused: want, stopSerials: settings.autoFormat.stopSerials || [], allowSerials: [] });
+      /* 2026-09-22（用户）：点「恢复续格」不只是改开关 —— 要立即重新判定并排任务，
+         否则被“连续失败已搁置”的盘永远不会再自动格。 */
+      let clearedFails = 0;
+      if (!want) { try { clearedFails = autoformat.clearFails(); } catch (e) {} autoformat.tickSoon(ex, 1200, { force: true }); }
+      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-pause', paused: want, clearedStopSerials: cleared, clearedFails, by: req.user && req.user.user });
+      return json(res, 200, { ok: true, paused: want, stopSerials: settings.autoFormat.stopSerials || [], allowSerials: [], clearedFails });
     }
     if (p === '/api/v1/autoformat/stop-serial' && m === 'POST') {
       const sn = String(body.serial || '').trim();
@@ -929,8 +953,11 @@ const handler = async (req, res) => {
       else { stops = on(stops, true); allows = on(allows, false); }
       settings.autoFormat = Object.assign({}, at, { stopSerials: stops, allowSerials: allows });
       store.save('settings', settings);
-      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-stop-serial', serial: sn, action: act, by: req.user && req.user.user });
-      return json(res, 200, { ok: true, stopSerials: stops, allowSerials: allows });
+      /* 2026-09-22（用户）：单盘「恢复续格 / 放行」也要立即重新判定（并清掉该盘的失败搁置） */
+      let clearedFails1 = 0;
+      if (act === 'remove' || act === 'allow') { try { clearedFails1 = autoformat.clearFails(sn); } catch (e) {} autoformat.tickSoon(ex, 1200, { force: true }); }
+      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-stop-serial', serial: sn, action: act, clearedFails: clearedFails1, by: req.user && req.user.user });
+      return json(res, 200, { ok: true, stopSerials: stops, allowSerials: allows, clearedFails: clearedFails1 });
     }
 
     /* 自动续格控制 / 单盘截停（按机器维度）
@@ -959,8 +986,10 @@ const handler = async (req, res) => {
           stopSerials: want1 ? (cur1.stopSerials || []) : [],
         });
         store.save('settings', settings);
-        store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-pause', paused: want1, clearedStopSerials: cleared1, by: req.user && req.user.user });
-        return json(res, 200, { ok: true, paused: want1, stopSerials: settings.autoFormat.stopSerials || [], allowSerials: [] });
+        let clearedFails2 = 0;
+        if (!want1) { try { clearedFails2 = autoformat.clearFails(); } catch (e) {} autoformat.tickSoon(ex, 1200, { force: true }); }
+        store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-pause', paused: want1, clearedStopSerials: cleared1, clearedFails: clearedFails2, by: req.user && req.user.user });
+        return json(res, 200, { ok: true, paused: want1, stopSerials: settings.autoFormat.stopSerials || [], allowSerials: [], clearedFails: clearedFails2 });
       }
       const sn2 = String(body.serial || '').trim();
       if (!sn2) return json(res, 400, { error: '缺少序列号' });
@@ -974,8 +1003,10 @@ const handler = async (req, res) => {
       else { stops2 = on2(stops2, true); allows2 = on2(allows2, false); }
       settings.autoFormat = Object.assign({}, at2, { stopSerials: stops2, allowSerials: allows2 });
       store.save('settings', settings);
-      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-stop-serial', serial: sn2, action: act2, by: req.user && req.user.user });
-      return json(res, 200, { ok: true, stopSerials: stops2, allowSerials: allows2 });
+      let clearedFails2b = 0;
+      if (act2 === 'remove' || act2 === 'allow') { try { clearedFails2b = autoformat.clearFails(sn2); } catch (e) {} autoformat.tickSoon(ex, 1200, { force: true }); }
+      store.appendJSONL('audit.jsonl', { at: Date.now(), kind: 'autoformat-stop-serial', serial: sn2, action: act2, clearedFails: clearedFails2b, by: req.user && req.user.user });
+      return json(res, 200, { ok: true, stopSerials: stops2, allowSerials: allows2, clearedFails: clearedFails2b });
     }
 
     /* 机器列表同步：POST 立即同步 / GET 状态 */
@@ -1067,6 +1098,18 @@ const handler = async (req, res) => {
       }
       return proxy(machine, req, res, '/api/v1/jobs', 'GET', null, u.query);
     }
+    /* 远程机器的任务日志 / 进度流（按机器，方便前端选中哪台就看哪台的任务） */
+    mm = p.match(/^\/api\/v1\/machines\/([^/]+)\/jobs\/([^/]+)\/(log|stream)$/);
+    if (mm) {
+      const machineJ = findMachine(mm[1]);
+      if (!machineJ) return json(res, 404, { error: '机器不存在' });
+      const tailJ = `/api/v1/jobs/${mm[2]}/${mm[3]}`;
+      if (!machineJ.local) {
+        if (mm[3] === 'stream' && m === 'GET') return proxySSE(machineJ, req, res, tailJ, u.query);
+        return proxy(machineJ, req, res, tailJ, m, null, u.query);
+      }
+      p = tailJ;   /* 本机：改写路径后走下面原有处理 */
+    }
     mm = p.match(/^\/api\/v1\/machines\/([^/]+)\/formatting$/);
     if (mm && m === 'GET') {
       const machine = findMachine(mm[1]);
@@ -1104,12 +1147,12 @@ const handler = async (req, res) => {
       }
       if (!tail && m === 'GET') {
         const r = await getDisks(u.query.scan === '1');
-        if (u.query.scan === '1') autoformat.tickSoon(ex, 1200);   // 手动刷新硬盘后也按“有缺陷就格”的规则跑一轮
+        if (u.query.scan === '1') autoformat.tickSoon(ex, 1200, { force: true });   // 手动刷新硬盘后也按“有缺陷就格”的规则立即跑一轮
         return json(res, 200, { disks: r.disks, tools: r.tools, scannedAt: r.scannedAt, localIps: localIPs(), port: settings.nodePort, dryRun: settings.dryRun });
       }
       if (tail === '/scan' && m === 'POST') {
         const r = await getDisks(true);
-        autoformat.tickSoon(ex, 1200);
+        autoformat.tickSoon(ex, 1200, { force: true });
         return json(res, 200, { disks: r.disks, tools: r.tools, scannedAt: r.scannedAt });
       }
       mm = tail.match(/^\/([^/]+)$/);

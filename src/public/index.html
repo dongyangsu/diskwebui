@@ -176,7 +176,33 @@
           <label class="f check"><input type="checkbox" id="sSys"> 系统盘/启动盘默认拦截</label>
           <label class="f check"><input type="checkbox" id="sMnt"> 已挂载盘默认拦截</label>
           <label class="f check"><input type="checkbox" id="sUnk"> 缺陷状态未知默认禁止</label>
-        </div>
+<h3>定时清理（wdckit 日志等会长到几十 G）</h3>
+          <label class="f check"><input type="checkbox" id="cEnabled"> 启用自动清理</label>
+          <label class="f">清理周期：每 <input id="cN" type="number" style="width:70px"> <select id="cU" class="everyunit"></select></label>
+          <label class="f">方式 <select id="cMode"><option value="truncate">清空内容（推荐，工具在写也能立即释放空间）</option><option value="delete">直接删除文件</option></select></label>
+          <label class="f">文件名（逗号分隔，支持 *） <input id="cPatterns" style="width:340px"></label>
+          <div class="row"><button class="btn primary" id="btnCleanNow">🧹 立即清理</button><span class="muted small" id="cleanInfo">—</span></div>
+
+<h3>机器列表同步（各节点互相同步，收敛成同一份）</h3>
+          <label class="f check"><input type="checkbox" id="syEnabled"> 启用自动同步</label>
+          <label class="f">同步周期：每 <input id="syN" type="number" style="width:70px"> <select id="syU" class="everyunit"></select></label>
+          <div class="muted small" id="syInfo">—</div>
+
+<h3>硬盘列表自动刷新</h3>
+          <label class="f check"><input type="checkbox" id="drEnabled"> 启用自动刷新（手动刷新 = 硬盘页的「扫描硬盘」按钮）</label>
+          <label class="f">刷新周期：每 <input id="drN" type="number" style="width:70px"> <select id="drU" class="everyunit"></select></label>
+          <div class="muted small" id="drInfo">—</div>
+          <label class="f check"><input type="checkbox" id="hpEnabled"> 热插拔即时检测（插入/拔出硬盘马上感知）</label>
+          <label class="f">检查频率：每 <input id="hpN" type="number" style="width:70px"> <select id="hpU" class="everyunit"></select></label>
+
+<h3>插盘自动格式化（检测到有缺陷的盘自动排队格式化）</h3>
+          <label class="f check"><input type="checkbox" id="afEnabled"> 启用自动格式化（插盘后自动检测）</label>
+          <label class="f check"><input type="checkbox" id="afOnlyDefect"> 仅对「有缺陷记录」的盘自动格（无缺陷的按规则禁止）</label>
+          <label class="f">检测周期：每 <input id="afN" type="number" style="width:70px"> <select id="afU" class="everyunit"></select></label>
+          <label class="f">同一盘冷却：每 <input id="afCN" type="number" style="width:70px"> <select id="afCU" class="everyunit"></select></label>
+          <label class="f">自动格的逻辑块大小 <input id="afLun" type="number" style="width:110px" placeholder="0=用默认"></label>
+          <div class="muted small" id="afInfo">—</div>
+</div>
         <div>
           <h3>工具包路径</h3>
           <div class="row"><button class="btn primary" id="btnDetectTools">🔍 自动检测工具路径</button><span class="muted small" id="detectInfo">各机版本/文件名不同，点一下自动认（hugo / wdckit / SeaChest）</span></div>
@@ -189,33 +215,6 @@
           <h3>命令行安全</h3>
           <label class="f check"><input type="checkbox" id="sConfirm"> 危险命令需二次确认</label>
           <label class="f">黑名单（逗号分隔） <input id="sBlack"></label>
-          <h3>定时清理（wdckit 日志等会长到几十 G）</h3>
-          <label class="f check"><input type="checkbox" id="cEnabled"> 启用自动清理</label>
-          <label class="f">清理周期：每 <input id="cN" type="number" style="width:70px"> <select id="cU" class="everyunit"></select></label>
-          <label class="f">方式 <select id="cMode"><option value="truncate">清空内容（推荐，工具在写也能立即释放空间）</option><option value="delete">直接删除文件</option></select></label>
-          <label class="f">文件名（逗号分隔，支持 *） <input id="cPatterns" style="width:340px"></label>
-          <div class="row"><button class="btn primary" id="btnCleanNow">🧹 立即清理</button><span class="muted small" id="cleanInfo">—</span></div>
-
-          <h3>机器列表同步（各节点互相同步，收敛成同一份）</h3>
-          <label class="f check"><input type="checkbox" id="syEnabled"> 启用自动同步</label>
-          <label class="f">同步周期：每 <input id="syN" type="number" style="width:70px"> <select id="syU" class="everyunit"></select></label>
-          <div class="muted small" id="syInfo">—</div>
-
-          <h3>硬盘列表自动刷新</h3>
-          <label class="f check"><input type="checkbox" id="drEnabled"> 启用自动刷新（手动刷新 = 硬盘页的「扫描硬盘」按钮）</label>
-          <label class="f">刷新周期：每 <input id="drN" type="number" style="width:70px"> <select id="drU" class="everyunit"></select></label>
-          <div class="muted small" id="drInfo">—</div>
-          <label class="f check"><input type="checkbox" id="hpEnabled"> 热插拔即时检测（插入/拔出硬盘马上感知）</label>
-          <label class="f">检查频率：每 <input id="hpN" type="number" style="width:70px"> <select id="hpU" class="everyunit"></select></label>
-
-          <h3>插盘自动格式化（检测到有缺陷的盘自动排队格式化）</h3>
-          <label class="f check"><input type="checkbox" id="afEnabled"> 启用自动格式化（插盘后自动检测）</label>
-          <label class="f check"><input type="checkbox" id="afOnlyDefect"> 仅对「有缺陷记录」的盘自动格（无缺陷的按规则禁止）</label>
-          <label class="f">检测周期：每 <input id="afN" type="number" style="width:70px"> <select id="afU" class="everyunit"></select></label>
-          <label class="f">同一盘冷却：每 <input id="afCN" type="number" style="width:70px"> <select id="afCU" class="everyunit"></select></label>
-          <label class="f">自动格的逻辑块大小 <input id="afLun" type="number" style="width:110px" placeholder="0=用默认"></label>
-          <div class="muted small" id="afInfo">—</div>
-
           <h3>版本同步（以主服务器为准，开机自动补齐最新代码）</h3>
           <label class="f check"><input type="checkbox" id="auEnabled"> 启用自动同步更新（离线机器开机后自动更新）</label>
           <label class="f check"><input type="checkbox" id="auIdle"> 有格式化任务在跑时先不更新（跑完再更）</label>
@@ -251,7 +250,7 @@
       </div>
       <div class="row"><button class="btn primary" id="btnSaveSettings">保存设置</button><span id="saveInfo" class="muted"></span></div>
       <h3>格式化历史（可导出 CSV）</h3>
-      <div class="row"><button class="btn" id="btnHistRefresh">刷新</button><button class="btn primary" id="btnHistCsv">导出 CSV</button><span class="muted small" id="histInfo"></span></div>
+      <div class="row"><button class="btn" id="btnHistRefresh">刷新</button><button class="btn primary" id="btnHistCsv">导出 CSV</button><button class="btn danger" id="btnHistClear">🗑 清空历史</button><span class="muted small" id="histInfo"></span></div>
       <div style="max-height:320px;overflow:auto">
         <table class="tbl"><thead><tr><th>时间</th><th>设备</th><th>SN</th><th>品牌</th><th>工具</th><th>逻辑块</th><th>轮次</th><th>状态</th><th>耗时</th></tr></thead><tbody id="histRows"></tbody></table>
       </div>

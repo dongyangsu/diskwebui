@@ -4,10 +4,20 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const TOKEN_KEY = 'dw_token';
 let TOKEN = localStorage.getItem(TOKEN_KEY) || '';
+/* 2026-09-22：机器作用域 —— 除了全局接口，其余请求一律带上「当前选中的机器」，
+   保证「选中哪台，页面上的数据/操作就是哪台」。
+   全局接口：登录、机器列表/同步、本机版本与健康、改自己密码。 */
+const GLOBAL_API = ['/login', '/logout', '/me', '/password', '/machines', '/version', '/health', '/bundle', '/terminal'];
+function scopedPath(path) {
+  if (!path.startsWith('/') || path.startsWith('/machines')) return path;
+  const seg = '/' + (path.split('?')[0].split('/')[1] || '');
+  if (GLOBAL_API.indexOf(seg) >= 0) return path;
+  return `/machines/${S.machineId || 'local'}${path}`;
+}
 const api = async (path, method = 'GET', body) => {
   const h = { 'Content-Type': 'application/json' };
   if (TOKEN) h['x-token'] = TOKEN;
-  const r = await fetch('/api/v1' + path, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+  const r = await fetch('/api/v1' + scopedPath(path), { method, headers: h, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) showLogin();
   if (r.status === 403) toast('⛔ ' + (j.error || '权限不足'), 5000);
@@ -466,7 +476,7 @@ function openBatchConfirm(list) {
     if (r.error) { $('#bResult').textContent = '失败：' + r.error; $('#bGo').disabled = false; return; }
     $('#bResult').textContent = (r.results || []).map((x) => (x.ok ? '✔ ' + x.device + ' → 已启动 ' + x.jobId + '\n   ' + x.command : '✖ ' + x.device + ' ' + x.error)).join('\n');
     toast('批量任务已提交');
-    if ((r.results || []).some((x) => x.ok)) watchJob(r.results.find((x) => x.ok).jobId);
+    if ((r.results || []).some((x) => x.ok)) watchJob(r.results.find((x) => x.ok).jobId, S.machineId);
     pollJobs();
   };
   refresh();
@@ -721,11 +731,12 @@ $('#confirmGo').onclick = async () => {
   const r = await api(`/machines/${S.machineId}/disks/${encodeURIComponent(d.id)}/format`, 'POST', Object.assign({}, S.cfg, { confirm: true }));
   if (r.error) return toast('失败：' + r.error);
   toast('任务已启动' + (r.job && r.job.dryRun ? '（dryRun 演示模式）' : ''));
-  watchJob(r.job.id);
+  watchJob(r.job.id, S.machineId);
 };
-function watchJob(jobId) {
+function watchJob(jobId, mid) {
+  const jm = mid || S.machineId || 'local';
   if (S.jobES) S.jobES.close();
-  const es = new EventSource(`/api/v1/jobs/${jobId}/stream?token=${encodeURIComponent(TOKEN)}`);
+  const es = new EventSource(`/api/v1/machines/${jm}/jobs/${jobId}/stream?token=${encodeURIComponent(TOKEN)}`);
   S.jobES = es;
   es.onmessage = (ev) => {
     const o = JSON.parse(ev.data);
@@ -742,7 +753,7 @@ function watchJob(jobId) {
       ${fmtDefectSnap('📋 格式化前缺陷', st.defectBefore)}
       ${fmtDefectSnap('📋 格式化后缺陷', st.defectAfter)}`;
     const bl = $('#btnJobLog');
-    if (bl) bl.onclick = () => window.open(`/api/v1/jobs/${jobId}/log?token=${encodeURIComponent(TOKEN)}`, '_blank');
+    if (bl) bl.onclick = () => window.open(`/api/v1/machines/${jm}/jobs/${jobId}/log?token=${encodeURIComponent(TOKEN)}`, '_blank');
     const b = $('#btnStopJob');
     if (b) b.onclick = async () => {
       if (!(await askConfirm('停止格式化需二次确认，确认停止？'))) return;
@@ -843,7 +854,7 @@ function renderDiskProgress() {
     <div class="muted small">${st.progress == null ? '进度未知（外部命令发起，盘处于忙状态）' : st.progress + '%'}
       ${st.jobId ? `<button class="btn small" id="btnJobLog" style="margin-left:8px">下载完整日志</button>` : ''}</div>`;
   const b2 = document.getElementById('btnJobLog');   /* 2026-09-20 静态测试清理：去掉一个不存在的 id 死引用 */
-  if (b2 && st.jobId) b2.onclick = () => window.open('/api/v1/jobs/' + st.jobId + '/log?token=' + encodeURIComponent(TOKEN), '_blank');
+  if (b2 && st.jobId) b2.onclick = () => window.open('/api/v1/machines/' + (S.machineId || 'local') + '/jobs/' + st.jobId + '/log?token=' + encodeURIComponent(TOKEN), '_blank');
 }
 
 /* ---------------- 命令行（多开/多标签） ---------------- */
@@ -936,10 +947,11 @@ function histKey(e, input) {
   e.preventDefault();
   return true;
 }
-$('#btnTermStop').onclick = async () => { const t = S.tabs.find((x) => x.id === S.activeTab); if (t) { await api(`/terminal/${t.id}/stop`, 'POST', {}); toast('已发送中断'); } };
+$('#btnTermStop').onclick = async () => { const t = S.tabs.find((x) => x.id === S.activeTab); if (t) { const tmid1 = S.termMachine || 'local'; await api(tmid1 === 'local' ? `/terminal/${t.id}/stop` : `/machines/${tmid1}/terminal/${t.id}/stop`, 'POST', {}); toast('已发送中断'); } };
 $('#btnSetCwd').onclick = async () => {
   const t = S.tabs.find((x) => x.id === S.activeTab) || newTab();
-  const r = await api(`/terminal/${t.id}/cwd`, 'POST', { cwd: $('#termCwd').value.trim() });
+  const tmid2 = S.termMachine || 'local';
+  const r = await api(tmid2 === 'local' ? `/terminal/${t.id}/cwd` : `/machines/${tmid2}/terminal/${t.id}/cwd`, 'POST', { cwd: $('#termCwd').value.trim() });
   t.cwd = r.cwd; toast('工作目录：' + r.cwd);
 };
 $$('.quick').forEach((b) => b.onclick = () => { $('#termInput').value = b.dataset.cmd; $('#termInput').focus(); });
@@ -1277,11 +1289,7 @@ async function loadClean() {
     + (list.length ? '<br>' + list.slice(0, 3).map((f) => esc(f.path) + ' (' + f.sizeMB + 'MB)').join('<br>') : '');
 }
 $('#btnSaveSettings').onclick = async () => {
-  /* 格式化历史：刷新 / 导出 CSV */
-  const bh = document.getElementById('btnHistRefresh');
-  if (bh) bh.onclick = () => loadHistory();
-  const bc = document.getElementById('btnHistCsv');
-  if (bc) bc.onclick = () => window.open('/api/v1/history.csv?token=' + encodeURIComponent(TOKEN), '_blank');  const body = {
+  const body = {
     nodePort: Number($('#sPort').value), defaultLunSize: Number($('#sLun').value), dryRun: $('#sDry').checked,
     toolPaths: { hugo: $('#sHugo').value, wdckit: $('#sWdckit').value, seachest: $('#sSea').value },
     toolBins: { hugo: $('#sHugoBin').value.trim(), wdckit: $('#sWdckitBin').value.trim(), seachest: $('#sSeaBin').value.trim() },
@@ -1388,6 +1396,24 @@ async function openLabelPreview(ids) {
 }
 
 /* ---------------- 格式化历史 ---------------- */
+/* 格式化历史：刷新 / 导出 CSV / 清空历史（用户 2026-09-22 要求加「清空历史」按钮）
+   注：原来这三个按钮的绑定写在“保存设置”的 onclick 里 → 不点保存就不生效，一并修正。 */
+function wireHistButtons() {
+  const bh = document.getElementById('btnHistRefresh');
+  if (bh) bh.onclick = () => loadHistory();
+  const bc = document.getElementById('btnHistCsv');
+  if (bc) bc.onclick = () => window.open('/api/v1/machines/' + (S.machineId || 'local') + '/history.csv?token=' + encodeURIComponent(TOKEN), '_blank');
+  const bcl = document.getElementById('btnHistClear');
+  if (bcl) bcl.onclick = async () => {
+    if (!(await askConfirm('确定清空「格式化历史」？清空后不可恢复（审计日志会留一条记录）。'))) return;
+    const r = await api('/history/clear', 'POST', {});
+    if (r.error) return toast('清空失败：' + r.error);
+    toast('已清空 ' + (r.cleared || 0) + ' 条格式化历史');
+    loadHistory();
+  };
+}
+wireHistButtons();
+
 async function loadHistory() {
   const tb = document.getElementById('histRows');
   if (!tb) return;

@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 /* 只对“清单内”的文件算指纹：多出来的野文件（如误拷的 lib/server.js）不应影响版本比对 */
 const KNOWN_LIB = ['autoformat.js', 'autoupdate.js', 'build.js', 'clean.js', 'detect.js', 'exec.js', 'rules.js', 'store.js', 'tls.js', 'tools.js'];

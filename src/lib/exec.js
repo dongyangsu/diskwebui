@@ -476,6 +476,7 @@ function markPct(job, p) {
 }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function jlog(job, line) {
+  job.lastOutputAt = Date.now();            /* 2026-09-22：记“最后一次有输出”的时间，超时判定用 */
   job.log.push(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${line}`);
   if (job.log.length > 500) job.log.shift();
   for (const send of job.subs) { try { send({ type: 'log', line }); } catch (e) {} }
@@ -862,6 +863,16 @@ function shouldExtendJobTimeout(job, now) {
   if (t - started > 24 * 3600 * 1000) return false;                 // 硬上限 24 小时
   const lastAt = Number(job.lastProgressAt) || started;
   if (job.pctSeen && t - lastAt < 30 * 60 * 1000) return true;       // 有百分比且近 30 分钟刷新过
+  /* 2026-09-22 修复（139 真机实测：wdckit 格西数盘被 60s 超时误杀，延长没生效）：
+     sg_turs 对 SATA/wdckit 这类盘不报 “format in progress” → 原来会误判“无进展”直接杀。
+     补两条“还在干活”的证据：① 进程还活着且近 15 分钟有日志输出；② 进程还活着且是天生长时间运行的格式化工具。 */
+  const alive = pidAlive(job.pid);
+  if (alive) {
+    const lastOut = Number(job.lastOutputAt) || started;
+    if (t - lastOut < 15 * 60 * 1000) return true;
+    const tool = String(job.toolId || '') + ' ' + String(job.toolName || '');
+    if (/hugo|wdckit|sg_format|SeaChest/i.test(tool)) return true;
+  }
   const dev = (job.devices || [])[0] || job.device;
   try { const r = probeFormatProgress(dev); if (r && (r.progress != null || r.formatting)) return true; } catch (e) {}
   return false;

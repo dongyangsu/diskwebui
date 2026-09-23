@@ -19,6 +19,16 @@ function loadFails() {
 function saveFails(o) {
   try { fs.writeFileSync(FAILS_FILE, JSON.stringify(o, null, 2)); } catch (e) {}
 }
+/* 2026-09-22（用户）：手动「恢复续格 / 扫描硬盘」时把「连续失败已搁置」的计数清掉，
+   否则盘被搁置后，即使用户点恢复续格也永远不会再自动排任务。 */
+function clearFails(serial) {
+  const o = loadFails();
+  let n = 0;
+  if (!serial) { for (const k of Object.keys(o)) { delete o[k]; n++; } }
+  else if (o[serial]) { delete o[serial]; n = 1; }
+  if (n) saveFails(o);
+  return n;
+}
 /* 盘无响应检测：NOT READY 且不是“format in progress” → 根本格不动 */
 function probeReady(dev) {
   if (!dev || !String(dev).startsWith('/dev/')) return { ready: true };
@@ -61,7 +71,8 @@ function logThrottled(kind, sn, reasonKey, obj, ms) {
 
 /* 用户 2026-09-17 明确规则：只要检测到「有缺陷」就自动格式化。
    触发点：定时扫描、手动刷新硬盘、插盘、格完再检测 —— 全部走这里。 */
-async function tick(exec) {
+async function tick(exec, opts) {
+  const opt = opts || {};
   const st = load('settings');
   const cfg = st.autoFormat || {};
   if (!cfg.enabled || busy) return;
@@ -75,7 +86,7 @@ async function tick(exec) {
     const curSet = new Set();
     for (const d of r.disks) { const s0 = d.serial || d.device; if (s0) curSet.add(s0); }
     const pending = [];                      // 本轮的待格候选（按工具合批）
-    const firstRound = !presentSet;          // 启动后第一轮：只记录不触发（否则重启会把机箱里所有盘都格一遍）
+    const firstRound = !presentSet && !opt.force;    // 启动后第一轮：只记录不触发（否则重启会把机箱里所有盘都格一遍）；用户手动扫描/点续格时 force=true 跳过此限制
     if (firstRound) presentSet = new Set(curSet);
     for (const d of r.disks) {
       const sn = d.serial || d.device;
@@ -159,9 +170,9 @@ async function tick(exec) {
         }
       }
       if (busyDisk) continue;
-      /* 冷却（防止格完立刻又格同一块，符合 cooldownSec 设置） */
+      /* 冷却（防止格完立刻又格同一块，符合 cooldownSec 设置）；用户手动扫描/续格(force) 不受冷却限制 */
       const last = recent.get(sn) || 0;
-      if (now - last < (Number(cfg.cooldownSec) || 300) * 1000) continue;
+      if (!opt.force && now - last < (Number(cfg.cooldownSec) || 300) * 1000) continue;
 
       const cfgFmt = {
         toolId: cfg.toolId || rules.recommendTool(d, st),
@@ -215,9 +226,10 @@ async function tick(exec) {
   } finally { busy = false; }
 }
 
-/* 手动刷新 / 插盘 / 格完后立刻补一刀（延后几秒等状态稳定） */
-function tickSoon(exec, delayMs) {
-  setTimeout(() => { tick(exec).catch(() => {}); }, Number(delayMs) || 1500);
+/* 手动刷新 / 插盘 / 格完后立刻补一刀（延后几秒等状态稳定）
+   opts.force=true：用户手动点「扫描硬盘 / 恢复续格」时用 —— 跳过“首轮只记录”和冷却限制，立刻重新判定 */
+function tickSoon(exec, delayMs, opts) {
+  setTimeout(() => { tick(exec, opts).catch(() => {}); }, Number(delayMs) || 1500);
 }
 
 function start(exec) {
@@ -237,4 +249,4 @@ function start(exec) {
   } catch (e) {}
 }
 
-module.exports = { start, tick, tickSoon, loadSeen, saveSeen };
+module.exports = { start, tick, tickSoon, loadSeen, saveSeen, clearFails };
