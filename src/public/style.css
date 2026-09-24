@@ -4,8 +4,8 @@
   --blue:#2563eb; --blue-d:#1d4ed8; --green:#16a34a; --amber:#d97706; --red:#dc2626;
   --dark:#0f172a; --mono:"JetBrains Mono",Consolas,"Liberation Mono",Menlo,monospace;
 }
-html,body{margin:0;height:100%;}
-body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;}
+html,body{margin:0;height:100%;overflow:hidden;}   /* 页面本体不出现侧边纵向滚动条：内容在各自区域内滚动 */
+body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;display:flex;flex-direction:column;}
 button{font-family:inherit;}
 h2{font-size:17px;margin:0 0 12px;}
 h3{font-size:14px;margin:16px 0 8px;color:#334155;}
@@ -47,9 +47,17 @@ code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-family:var(--mono
 .btn.small{padding:3px 9px;font-size:12px;}
 .topbar .btn.primary, .dock .btn{background:var(--blue);border-color:var(--blue);color:#fff;}
 
-main{padding:14px;max-width:none;}
+main{padding:14px;max-width:none;flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;}
 .view{display:none;}
-.view.active{display:block;}
+.view.active{display:block;height:100%;min-height:0;overflow:auto;}
+/* 机器管理页：整页不滚，表格自己横向/纵向滚动（2026-09-24 用户要求） */
+#view-machines.view.active{display:flex;flex-direction:column;overflow:hidden;}
+#view-machines>.panel{flex:1;display:flex;flex-direction:column;min-height:0;}
+#view-machines .tablewrap{flex:1;min-height:120px;overflow:auto;}
+#machineTable{min-width:880px;}
+@media (max-width:1200px){ .brand{font-size:24px} .mtoolbar .tbl-q{flex:1 1 200px} }
+@media (max-width:900px){ .brand{font-size:20px} .mtoolbar{gap:6px} .mtoolbar .tbl-q{flex:1 1 100%;order:-1} .mrow2{flex-wrap:wrap} .mtoolbar #viewSel{max-width:130px} }
+@media (max-width:600px){ .brand .ver{display:none} .mtoolbar .btn{padding:5px 8px;font-size:12px} #machineTable{min-width:760px} }
 
 /* 仪表盘三栏 */
 .dash{display:grid;grid-template-columns:360px minmax(520px,1fr) 420px;gap:14px;align-items:start;}
@@ -139,6 +147,40 @@ main{padding:14px;max-width:none;}
 input[type=text],input:not([type]),input[type=number],select,textarea{border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-family:inherit;font-size:13px;background:#fff;color:var(--text);}
 .row input{min-width:120px;}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:24px;}
+
+/* ===== 全站各页自适应 v4（2026-09-24）：每个页面各自内部滚动，页面本体不出滚动条 ===== */
+/* 硬盘页：三栏自适应 + 列表/详情各自滚动 */
+#view-dash.view.active{display:flex;flex-direction:column;overflow:hidden;}
+#view-dash .dash{flex:1;min-height:0;align-items:stretch;}
+#view-dash .col{display:flex;flex-direction:column;min-height:0;}
+#view-dash #diskList.disklist{flex:1;min-height:120px;max-height:none;overflow:auto;}
+#view-dash .col.mid{overflow:hidden;}
+#view-dash #detail.detail{flex:1;min-height:0;overflow:auto;}
+#view-dash .col.right{overflow:auto;}
+/* 命令行页：终端区域铺满剩余高度 */
+#view-terminal.view.active{display:flex;flex-direction:column;overflow:hidden;}
+#view-terminal .termpanel{flex:1;display:flex;flex-direction:column;min-height:0;}
+#view-terminal .termout{flex:1;min-height:140px;height:auto;}
+/* 全局日志页：面板内部滚动 + 表格 self-scroll */
+#view-logs.view.active{display:flex;flex-direction:column;overflow:hidden;}
+#view-logs>.panel{flex:1;display:flex;flex-direction:column;min-height:0;}
+#view-logs>.panel .tablewrap{flex:1;min-height:140px;overflow:auto;}
+/* 设置页：面板内部滚动 */
+#view-settings.view.active{display:flex;flex-direction:column;overflow:hidden;}
+#view-settings>.panel{flex:1;min-height:0;overflow:auto;}
+@media (max-width:1500px){ .dash{grid-template-columns:330px minmax(340px,1fr) 360px;} }
+@media (max-width:1200px){
+  .dash{grid-template-columns:320px minmax(320px,1fr);}
+  #view-dash .col.right{grid-column:1 / -1;max-height:300px;}
+}
+@media (max-width:860px){
+  #view-dash.view.active{overflow:auto;}
+  .dash{grid-template-columns:1fr;height:auto;}
+  #view-dash .col{max-height:none;}
+  #view-dash .col.right{max-height:none;}
+  #view-dash #diskList.disklist{max-height:48vh;}
+  .grid2{grid-template-columns:1fr;}
+}
 label.f{display:block;margin:6px 0;color:#334155;font-size:13px;}
 label.f input[type=text],label.f input:not([type]),label.f input[type=number]{width:320px;}
 label.f.check{display:flex;align-items:center;gap:8px;}
@@ -197,4 +239,108 @@ body.logged-out .topbar,body.logged-out main,body.logged-out #dock,body.logged-o
 .cmdpreview pre{margin:4px 0;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-all;}
 .check.big{display:flex;gap:8px;align-items:center;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:8px;padding:10px;font-weight:600;}
 .warnbox{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:8px;padding:10px;margin-top:10px;font-size:13px;}
-.toast{position:fixed;right:18px;bottom:18px;background:var(--dark);color:#fff;padding:10px 14px;border-radius:10px;z-index:60;box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:420px;}
+/* IP 悬浮小窗 */
+.ippop{position:fixed;z-index:80;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.15);padding:8px 10px;font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--text);pointer-events:none;max-width:280px;word-break:break-all;}
+.ippop .t{font-family:inherit;font-size:11px;color:var(--muted);margin-bottom:2px;}
+
+/* 表格排序（2026-09-24） */
+#machineTable th{position:relative;white-space:nowrap;}
+#machineTable th.sortable{cursor:pointer;user-select:none;}
+#machineTable th.sortable:hover{background:#f1f5f9;}
+#machineTable th .caret{display:inline-block;width:12px;margin-left:4px;color:#cbd5e1;font-size:11px;}
+#machineTable th.sorted .caret{color:var(--blue);font-weight:700;}
+#machineTable th .sortmore{border:0;background:transparent;color:#94a3b8;cursor:pointer;font-size:11px;padding:0 3px;margin-left:2px;border-radius:4px;line-height:1;}
+#machineTable th .sortmore:hover{background:#e2e8f0;color:var(--blue);}
+.sortpop{position:fixed;z-index:70;background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.18);padding:12px 14px;width:430px;}
+.sortpop .sp-head{font-weight:600;margin-bottom:2px;}
+.sortpop .sp-tip{margin-bottom:8px;}
+.sortpop .sp-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.sortpop .sp-row .lb{color:var(--muted);font-size:12px;width:68px;flex:none;}
+.sortpop select{padding:3px 6px;border:1px solid var(--line);border-radius:6px;font-size:13px;}
+.sortpop .sp-foot{display:flex;align-items:center;gap:8px;margin-top:10px;}
+.sortpop .sp-foot .spacer{flex:1;}
+
+/* 机器列表：工具栏 / 表格容器 / 列拖拽 / 右键菜单（2026-09-24 全面版） */
+.mtoolbar{display:flex;align-items:center;gap:8px;margin:10px 0 8px;padding:6px 10px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;}
+.mtoolbar .spacer{flex:1;}
+.mtoolbar #sortBar{font-family:var(--mono);}
+.tablewrap{overflow-x:auto;}
+#machineTable{table-layout:fixed;min-width:100%;}
+#machineTable th,#machineTable td{overflow:hidden;text-overflow:ellipsis;}
+#machineTable th{position:relative;white-space:nowrap;}
+#machineTable th .rz{position:absolute;top:0;right:0;width:7px;height:100%;cursor:col-resize;}
+#machineTable th .rz:hover{background:#bfdbfe;}
+#machineTable th.dragging{opacity:.45;}
+#machineTable th.dropbefore{box-shadow:inset 3px 0 0 var(--blue);}
+#machineTable td{vertical-align:middle;}
+.thmenu{position:fixed;z-index:90;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.18);padding:4px;min-width:180px;}
+.thmenu div{padding:6px 10px;border-radius:6px;cursor:pointer;font-size:13px;}
+.thmenu div:hover{background:#f1f5f9;}
+.thmenu .sep{height:1px;background:var(--line);margin:4px 6px;padding:0;}
+.sp-optbox{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);}
+.sp-optbox .f{margin-bottom:6px;}
+.sp-row .sp-seq{width:118px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;font-size:12px;}
+
+/* ---- 机器列表 v2：搜索/筛选chips/统计/选择/条件格式/冻结表头/视图（2026-09-24） ---- */
+.mtoolbar .tbl-q{flex:0 0 240px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;}
+.mtoolbar .chip-row{display:flex;gap:4px;flex-wrap:wrap;}
+.chip-btn.primary{background:var(--blue);color:#fff;border-color:var(--blue);}
+.mrow2{display:flex;align-items:center;gap:8px;margin:-2px 0 8px;padding:4px 8px;}
+.mrow2 .spacer{flex:1;}
+.batchbar2{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;}
+.view-sel{padding:3px 6px;border:1px solid var(--line);border-radius:6px;font-size:13px;max-width:170px;}
+#machineTable thead th{position:sticky;top:0;z-index:2;background:#f8fafc;}
+#machineTable tbody tr:nth-child(even){background:#fcfdff;}
+#machineTable tbody tr:hover{background:#eef4ff;}
+#machineTable th.selcol,#machineTable td:first-child{width:38px;text-align:center;}
+#machineTable tr.row-offline>td{background:#fef2f2;}
+#machineTable tr.row-unknown>td{background:#fffbeb;}
+#machineTable tr.row-local>td{background:#f5f3ff;}
+#machineTable tr.row-cursor>td{box-shadow:inset 0 0 0 2px var(--blue);}
+#machineTable.compact th,#machineTable.compact td{padding:2px 6px;font-size:12px;}
+#machineTable mark{background:#fde68a;color:inherit;padding:0 1px;border-radius:2px;}
+#machineTable th .fbtn{border:0;background:transparent;color:#94a3b8;cursor:pointer;font-size:11px;padding:0 3px;margin-left:2px;border-radius:4px;line-height:1;}
+#machineTable th .fbtn:hover{background:#e2e8f0;color:var(--blue);}
+#machineTable th .fbtn.f-on{color:#fff;background:var(--blue);}
+.fp-q{width:100%;padding:4px 8px;border:1px solid var(--line);border-radius:6px;margin:6px 0;font-size:13px;}
+.fp-tools{display:flex;gap:12px;margin-bottom:6px;font-size:12px;}
+.fp-tools a{color:var(--blue);cursor:pointer;}
+.fp-list{max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px 8px;}
+.fp-list label{display:block;margin:2px 0;font-size:13px;}
+.vw-row{display:flex;align-items:center;gap:6px;padding:4px 2px;border-bottom:1px dashed var(--line);}
+.pager{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 2px 2px;font-size:13px;}
+.pager .pg-sel{padding:2px 6px;border:1px solid var(--line);border-radius:6px;font-size:12px;}
+.print-only{display:none;}
+
+/* ---- 数据弹窗（导入/导出/打印）2026-09-24 v3 ---- */
+.dp-tabs{display:flex;gap:6px;margin:8px 0 6px;}
+.dp-text{width:100%;font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:8px;padding:6px 8px;box-sizing:border-box;}
+.dp-prev{margin-top:8px;max-height:170px;overflow:auto;background:#0f172a;color:#e2e8f0;font-family:var(--mono);font-size:11px;padding:8px 10px;border-radius:8px;white-space:pre;}
+#printHead{display:none;}
+@media print{
+  html,body{height:auto;overflow:visible;}
+  body{background:#fff;display:block;}
+  main{overflow:visible;height:auto;display:block;padding:0;}
+  .view.active{overflow:visible;height:auto;}
+  #view-machines.view.active{display:block;overflow:visible;}
+  #view-machines>.panel{display:block;}
+  #machineTable{min-width:0;}
+  .topbar,.mtoolbar,.mrow2,.batchbar2,#toast,.sortpop,.thmenu,.ippop,#bulkBox,#loginPage,#loginModal,.no-print,.panel>.row,.panel>h2,.panel>p.muted{display:none!important;}
+  #printHead{display:block!important;margin:0 0 8px;}
+  .print-only{display:block!important;}
+  #view-machines .tablewrap,#view-machines #pager{display:none!important;}
+  .ph-title{font-size:16px;font-weight:700;}
+  .ph-sub{font-size:11px;color:#444;margin-top:2px;}
+  .view{display:none!important;}
+  #view-machines{display:block!important;}
+  .panel{border:0;box-shadow:none;padding:0;}
+  .tablewrap{overflow:visible;}
+  #machineTable{font-size:11px;table-layout:auto;width:100%;}
+  #machineTable thead th{position:static;background:#f2f2f2;print-color-adjust:exact;-webkit-print-color-adjust:exact;}
+  #machineTable th .caret,#machineTable th .fbtn,#machineTable th .sortmore,#machineTable th .rz{display:none!important;}
+  #machineTable th.selcol,#machineTable td:first-child,#machineTable th:last-child,#machineTable td:last-child{display:none!important;}
+  body.print-nocolor #machineTable tr.row-offline>td,body.print-nocolor #machineTable tr.row-unknown>td,body.print-nocolor #machineTable tr.row-local>td,body.print-nocolor #machineTable tbody tr:nth-child(even){background:#fff!important;}
+  body:not(.print-nocolor) #machineTable tr.row-offline>td{background:#fef2f2!important;print-color-adjust:exact;-webkit-print-color-adjust:exact;}
+  body:not(.print-nocolor) #machineTable tr.row-unknown>td{background:#fffbeb!important;print-color-adjust:exact;-webkit-print-color-adjust:exact;}
+}
+
