@@ -128,6 +128,7 @@ function requiredRole(p, m) {
   if (p === '/api/v1/password') return 'viewer';     // 改自己密码：登录即可
   if (/\/disks\/[^/]+\/(format|stop)$/.test(p) || /batch-format$/.test(p)) return 'operator';
   if (/\/override$/.test(p) || p.startsWith('/api/v1/templates')) return 'operator';
+  if (p === '/api/v1/tableprefs') return 'viewer';   /* 各人自己的列表偏好（排序/筛选/视图），登录即可存 */
   return 'admin';
 }
 
@@ -543,7 +544,7 @@ const handler = async (req, res) => {
     return;
   }
 
-  const body = (m === 'POST' || m === 'PATCH' || m === 'DELETE') ? await readBody(req) : {};
+  const body = (m === 'POST' || m === 'PATCH' || m === 'PUT' || m === 'DELETE') ? await readBody(req) : {};
 
   /* IP 白名单（第十二章：内网限制） */
   if (settings.ipWhitelist && settings.ipWhitelist.length) {
@@ -602,8 +603,8 @@ const handler = async (req, res) => {
        现统一：/api/v1/machines/<mid>/<rest>
          · mid=local  → 改写成 /api/v1/<rest>，走下面原有处理（同机同逻辑）
          · mid=远端   → 代理到该机器的 /api/v1/<rest>
-       下面这几个已有专门处理的路径不走这里（保持原样）：disks|autoformat|jobs|formatting|terminal */
-    let mmScope = p.match(/^\/api\/v1\/machines\/([^/]+)\/(?!disks|autoformat|jobs|formatting|terminal)(.+)$/);
+       下面这几个已有专门处理的路径不走这里（保持原样）：disks|autoformat|jobs|formatting|terminal|test|connect */
+    let mmScope = p.match(/^\/api\/v1\/machines\/([^/]+)\/(?!disks|autoformat|jobs|formatting|terminal|test|connect)(.+)$/);
     if (mmScope) {
       const mScope = findMachine(mmScope[1]);
       if (!mScope) return json(res, 404, { error: '机器不存在' });
@@ -632,12 +633,37 @@ const handler = async (req, res) => {
     /* 机器管理 */
     if (p === '/api/v1/machines' && m === 'GET') {
       const ms = store.load('machines');
+      /* 本机那条永远在线：刷一下状态/最后检测时间（否则会停留在当初添加的旧时间，用户 2026-09-24 指出） */
+      const li = ms.findIndex((x) => x.local);
+      if (li >= 0) { ms[li].status = 'online'; ms[li].lastCheck = Date.now(); store.save('machines', ms); }
       return json(res, 200, { machines: ms, localIps: localIPs(), port: settings.nodePort });
+    }
+    /* 各机器的网卡 IP 列表（并行探测，供列表页显示“多 IP”；2026-09-24 用户要求） */
+    if (p === '/api/v1/machines/ips' && m === 'GET') {
+      const ms = store.load('machines');
+      const out = {};
+      await Promise.all(ms.map(async (mc) => {
+        if (mc.local || mc.id === 'local') { out[mc.id] = localIPs().map((x) => x.ip); return; }
+        try {
+          const r = await httpReq(`http://${mc.ip}:${mc.port || settings.nodePort}/api/v1/health`, { timeoutMs: 2000 });
+          const j = await r.json();
+          const ips = (j.ips || []).map((x) => x.ip).filter(Boolean);
+          if (ips.length) {
+            out[mc.id] = ips;
+            const i = ms.findIndex((x) => x.id === mc.id);
+            if (i >= 0) ms[i].ips = ips;
+          } else if (mc.ips && mc.ips.length) out[mc.id] = mc.ips;
+        } catch (e) {
+          if (mc.ips && mc.ips.length) out[mc.id] = mc.ips;   /* 探不到就用上次缓存的 */
+        }
+      }));
+      store.save('machines', ms);
+      return json(res, 200, { ips: out });
     }
     if (p === '/api/v1/machines' && m === 'POST') {
       const ms = store.load('machines');
       const normIp = (s) => String(s || '').trim();
-      const isIp = (s) => /^(\d{1,3}\.){3}\d{1,3}$/.test(s);
+      const isIp = (s) => /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(s);
       const dup = (ip, port, excludeId) => ms.some((x) => normIp(x.ip) === normIp(ip) && Number(x.port || settings.nodePort) === Number(port || settings.nodePort) && x.id !== excludeId);
       if (body.bulk && body.bulk.length) {
         let n = 0, skipped = [];
@@ -659,7 +685,7 @@ const handler = async (req, res) => {
       ms.push(item); store.save('machines', ms);
       return json(res, 200, item);
     }
-    let mm = p.match(/^\/api\/v1\/machines\/([^/]+)$/);
+    let mm = p.match(/^\/api\/v1\/machines\/(?!sync$|ips$)([^/]+)$/);
     if (mm) {
       const ms = store.load('machines');
       const idx = ms.findIndex((x) => x.id === mm[1]);
@@ -671,7 +697,7 @@ const handler = async (req, res) => {
           const nip = String(body.ip !== undefined ? body.ip : ms[idx].ip).trim();
           const nport = Number(body.port !== undefined ? body.port : (ms[idx].port || settings.nodePort)) || settings.nodePort;
           const nname = String(body.name !== undefined ? body.name : ms[idx].name).trim();
-          if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(nip)) return json(res, 400, { error: 'IP 格式不正确：' + nip });
+          if (!/^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(nip)) return json(res, 400, { error: 'IP 格式不正确：' + nip });
           if (all.some((x) => x.id !== ms[idx].id && String(x.ip).trim() === nip && Number(x.port || settings.nodePort) === nport)) return json(res, 409, { error: `机器 ${nip}:${nport} 已存在（不能改成重复的 IP:端口）` });
           if (all.some((x) => x.id !== ms[idx].id && String(x.name).trim() === nname)) return json(res, 409, { error: `机器名称「${nname}」已被占用` });
         }
@@ -684,17 +710,18 @@ const handler = async (req, res) => {
       const machine = findMachine(mm[1]);
       if (!machine) return json(res, 404, { error: '机器不存在' });
       if (machine.local) {
-        const t = Date.now();
-        store.save('machines', store.load('machines'));
-        return json(res, 200, { online: true, ms: 0, target: `http://127.0.0.1:${settings.nodePort}`, via: 'local' });
+        const ms2 = store.load('machines'); const i2 = ms2.findIndex((x) => x.id === machine.id);
+        if (i2 >= 0) { ms2[i2].status = 'online'; ms2[i2].lastCheck = Date.now(); store.save('machines', ms2); }
+        return json(res, 200, { online: true, ms: 0, target: `http://127.0.0.1:${settings.nodePort}`, url: `http://${machine.ip || '127.0.0.1'}:${machine.port || settings.nodePort}`, via: 'local' });
       }
       const t0 = Date.now();
       try {
         const r = await httpReq(`http://${machine.ip}:${machine.port || settings.nodePort}/api/v1/health`, { timeoutMs: 3500 });
         const j = await r.json();
         const ms = Date.now() - t0;
+        const ips = (j.ips || []).map((x) => x.ip).filter(Boolean);
         const ms2 = store.load('machines'); const i2 = ms2.findIndex((x) => x.id === machine.id);
-        if (i2 >= 0) { ms2[i2].status = 'online'; ms2[i2].lastCheck = Date.now(); store.save('machines', ms2); }
+        if (i2 >= 0) { ms2[i2].status = 'online'; ms2[i2].lastCheck = Date.now(); if (ips.length) ms2[i2].ips = ips; store.save('machines', ms2); }
         if (mm[2] === 'connect') return json(res, 200, { url: `http://${machine.ip}:${machine.port || settings.nodePort}`, health: j });
         return json(res, 200, { online: true, ms, health: j });
       } catch (e) {
@@ -1478,6 +1505,23 @@ const handler = async (req, res) => {
       return json(res, 200, { ok: true, mode: r.mode, freedMB: +(r.freed / 1048576).toFixed(2), files: r.files, errors: r.errors });
     }
     if (p === '/api/v1/settings' && m === 'GET') return json(res, 200, settings);
+    /* 机器列表偏好：按用户分开存 + 可选的“全站默认”（2026-09-24） */
+    if (p === '/api/v1/tableprefs' && m === 'GET') {
+      const mt = settings.machinesTable || {};
+      const u = (req.user && req.user.user) || 'anonymous';
+      return json(res, 200, { mine: (mt.users && mt.users[u]) || null, shared: mt.shared || null, user: u });
+    }
+    if (p === '/api/v1/tableprefs' && (m === 'PUT' || m === 'POST')) {
+      const u = (req.user && req.user.user) || 'anonymous';
+      const mt = settings.machinesTable || {};
+      mt.users = mt.users || {};
+      if (body && body.mine) mt.users[u] = body.mine;
+      if (body && body.shared) mt.shared = body.shared;
+      if (body && body.clearMine) delete mt.users[u];
+      settings.machinesTable = mt;
+      store.save('settings', settings);
+      return json(res, 200, { ok: true, user: u });
+    }
     if (p === '/api/v1/settings' && m === 'PATCH') {
       settings = Object.assign(settings, body, { toolPaths: Object.assign(settings.toolPaths, body.toolPaths || {}), toolBins: Object.assign(settings.toolBins || {}, body.toolBins || {}), clean: Object.assign(settings.clean || {}, body.clean || {}), autoFormat: Object.assign(settings.autoFormat || {}, body.autoFormat || {}), toolSession: Object.assign(settings.toolSession || { enabled: true, idleQuitSec: 600 }, body.toolSession || {}), terminal: Object.assign(settings.terminal, body.terminal || {}), protect: Object.assign(settings.protect, body.protect || {}) });
       store.save('settings', settings);
