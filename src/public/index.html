@@ -3,13 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>硬盘检测与格式化 · Web 管理界面 V0.1</title>
+<title>硬盘检测与格式化 · Web 管理界面 V0.3</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext y='50' font-size='52'%3E%F0%9F%9B%A0%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="topbar">
   <div class="toprow">
-    <div class="brand">🛠 硬盘检测与格式化 <span class="ver">V0.2</span></div>
+    <div class="brand">🛠 硬盘检测与格式化 <span class="ver">V0.3</span></div>
 
     <div class="machine-pick">
       <label>当前机器</label>
@@ -108,11 +109,46 @@
         <button class="btn primary" id="btnBulkGo">导入</button>
         <button class="btn" id="btnBulkCancel">取消</button>
       </div>
-      <table class="tbl">
-        <thead><tr><th>名称</th><th>IP</th><th>端口</th><th>状态</th><th>最后检测</th><th>备注</th><th>操作</th></tr></thead>
-        <tbody id="machineRows"></tbody>
-      </table>
-      <p class="muted small">访问方式：<code>http://机器IP:端口</code>；点击「打开页面」直接跳转对应机器的管理界面。</p>
+      <div class="mtoolbar">
+        <input id="tblQ" class="tbl-q" placeholder="搜索名称 / IP / 机房 / 备注（Ctrl+F）">
+        <span class="chip-row">
+          <button class="btn small chip-btn" data-chip="all">全部</button>
+          <button class="btn small chip-btn" data-chip="online">在线</button>
+          <button class="btn small chip-btn" data-chip="offline">离线</button>
+          <button class="btn small chip-btn" data-chip="unknown">未知</button>
+          <button class="btn small chip-btn" data-chip="local">本机</button>
+          <button class="btn small chip-btn" data-chip="multiip">多IP</button>
+        </span>
+        <span class="spacer"></span>
+        <select id="viewSel" class="view-sel" title="切换已保存的视图"></select>
+        <button class="btn small" id="btnViews" title="保存 / 管理视图">视图管理…</button>
+        <button class="btn small" id="btnDensity" title="紧凑 / 舒适"></button>
+        <button class="btn small" id="btnOnlineFirst" title="把在线机器排在前面">置顶在线</button>
+        <button class="btn small" id="btnCols" title="显示/隐藏列、列宽、列顺序">列表设置</button>
+        <button class="btn small" id="btnData" title="导入 / 导出（支持 CSV/TSV/Excel/JSON/YAML/XML/HTML/Markdown/文本）">数据…</button>
+        <button class="btn small" id="btnPrint" title="打印当前列表">打印</button>
+      </div>
+      <div class="mrow2">
+        <span id="sortBar" class="muted small">未排序（点表头即可排序）</span>
+        <button class="btn small hide" id="btnClearAll">清除全部排序与筛选</button>
+        <span class="spacer"></span>
+        <span id="tblStats" class="muted small"></span>
+      </div>
+      <div id="batchBar" class="batchbar2 hide">
+        <span class="muted small">已选中机器：</span>
+        <button class="btn small" id="btnBatchTest">批量连接测试</button>
+        <button class="btn small danger" id="btnBatchDel">批量删除</button>
+        <button class="btn small" id="btnBatchSel">取消选择</button>
+      </div>
+      <div id="printHead"></div>
+      <div class="tablewrap">
+        <table class="tbl" id="machineTable">
+          <thead><tr id="machineHead"></tr></thead>
+          <tbody id="machineRows"></tbody>
+        </table>
+      </div>
+      <div id="pager" class="pager hide"></div>
+      <p class="muted small">访问方式：<code>http://机器IP:端口</code>；点击「打开页面」直接跳转对应机器的管理界面。排序/列设置会自动保存（服务端 + 本机），换电脑打开也是同一套。</p>
     </div>
   </section>
 
@@ -155,10 +191,12 @@
         <select id="logClearMode" class="small"><option value="archive">归档（保留旧日志文件）</option><option value="truncate">直接清空</option></select>
         <button class="btn danger" id="btnLogsClear">🧹 清理日志</button>
       </div>
-      <table class="tbl">
+      <div class="tablewrap">
+        <table class="tbl">
         <thead><tr><th>时间</th><th>类型</th><th>硬盘/命令</th><th>结果</th><th>详情</th></tr></thead>
         <tbody id="logRows"></tbody>
       </table>
+        </div>
     </div>
   </section>
 
@@ -333,7 +371,65 @@
   </div>
 </div>
 
+<!-- ============ 多字段编辑表单（一次填完，每格预填当前值；2026-09-24）============ -->
+<div id="formModal" class="modal hide">
+  <div class="dialog" style="width:480px">
+    <h2 id="formTitle" style="margin:0 0 12px">编辑</h2>
+    <div id="formFields"></div>
+    <div class="row right" style="margin-top:16px">
+      <button class="btn" id="formNo">取消</button>
+      <button class="btn primary" id="formGo">保存</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast hide"></div>
+<div id="ipPop" class="ippop hide"></div>
+
+<!-- ============ 自定义排序（Excel 式多条件 + 选项 + 自定义序列；2026-09-24）============ -->
+<div id="sortPop" class="sortpop hide">
+  <div class="sp-head">自定义排序</div>
+  <div class="sp-tip muted small">点表头切换升/降序（第三下取消）；按住 Shift 点表头 = 追加为次要条件</div>
+  <div id="spRows"></div>
+  <div class="sp-foot">
+    <button class="btn small" id="spAdd">＋ 添加条件</button>
+    <button class="btn small" id="spOpt">排序选项…</button>
+    <span class="spacer"></span>
+    <button class="btn small" id="spClear">清除排序</button>
+    <button class="btn small primary" id="spOk">确定</button>
+  </div>
+  <div id="spOptBox" class="sp-optbox hide">
+    <label class="f">中文排序方式
+      <select id="spCollation">
+        <option value="pinyin">按拼音</option>
+        <option value="stroke">按笔画</option>
+        <option value="none">按 Unicode 码位</option>
+      </select>
+    </label>
+    <label class="f"><input type="checkbox" id="spCase"> 区分大小写</label>
+    <label class="f"><input type="checkbox" id="spBlank" checked> 空白值排在最后</label>
+  </div>
+</div>
+
+<!-- ============ 列表设置（列显隐/列宽/列序；2026-09-24）============ -->
+<div id="colPop" class="sortpop hide" style="width:320px">
+  <div class="sp-head">列表设置</div>
+  <div class="sp-tip muted small">勾选要显示的列；拖动表头可改列顺序；拖动表头右边界可改列宽（双击边界=自动宽度）</div>
+  <div id="colRows"></div>
+  <div class="sp-foot">
+    <button class="btn small" id="colReset">恢复默认</button>
+    <span class="spacer"></span>
+    <button class="btn small primary" id="colOk">确定</button>
+  </div>
+</div>
+
+<!-- 表头右键菜单 -->
+<div id="thMenu" class="thmenu hide"></div>
+
+<!-- 列筛选弹窗 / 视图管理弹窗（2026-09-24 v2） -->
+<div id="filterPop" class="sortpop hide" style="width:340px"></div>
+<div id="viewPop" class="sortpop hide" style="width:460px"></div>
+<div id="dataPop" class="sortpop hide" style="width:560px"></div>
 
 <!-- ============ 登录 ============ -->
 <div id="loginModal" class="modal hide">
@@ -360,7 +456,7 @@
         <li>检测到缺陷自动排队格式化・完成后自动复检续轮</li>
         <li>多机统一管理・版本与时间自动同步</li>
       </ul>
-      <div class="lver">V0.2</div>
+      <div class="lver">V0.3</div>
     </div>
     <div class="login-right">
       <h2>用户登录</h2>
