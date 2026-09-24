@@ -62,6 +62,49 @@ function askModal(opts) {
 }
 const askConfirm = (msg, okText) => askModal({ msg, okText });
 const askPrompt = (msg, def) => askModal({ msg, def, input: true });
+/* 多字段表单弹窗（2026-09-24）：一次弹出所有格子，每格预填当前值，改完保存 */
+function askForm(title, fields, okText) {
+  return new Promise((resolve) => {
+    const m = $('#formModal');
+    if (!m) { /* 兵底：无弹窗就逐项用原生 prompt */
+      const out = {};
+      for (const f of fields) {
+        const v = window.prompt(f.label, f.value == null ? '' : String(f.value));
+        if (v === null) return resolve(null);
+        out[f.key] = v;
+      }
+      return resolve(out);
+    }
+    $('#formTitle').textContent = title || '编辑';
+    const box = $('#formFields');
+    box.innerHTML = '';
+    for (const f of fields) {
+      const lab = document.createElement('label');
+      lab.className = 'f';
+      lab.appendChild(document.createTextNode(f.label + ' '));
+      const inp = document.createElement('input');
+      inp.id = 'ff_' + f.key;
+      inp.value = f.value == null ? '' : String(f.value);
+      if (f.placeholder) inp.placeholder = f.placeholder;
+      if (f.readonly) inp.readOnly = true;
+      lab.appendChild(inp);
+      box.appendChild(lab);
+    }
+    $('#formGo').textContent = okText || '保存';
+    const collect = () => { const o = {}; for (const f of fields) o[f.key] = $('#ff_' + f.key).value; return o; };
+    const finish = (v) => { m.classList.add('hide'); m.onkeydown = null; resolve(v); };
+    $('#formGo').onclick = () => finish(collect());
+    $('#formNo').onclick = () => finish(null);
+    m.onclick = (e) => { if (e.target === m) finish(null); };
+    m.onkeydown = (e) => {
+      if (e.key === 'Enter' && e.target && e.target.tagName === 'INPUT') { e.preventDefault(); finish(collect()); }
+      else if (e.key === 'Escape') finish(null);
+    };
+    m.classList.remove('hide');
+    const first = box.querySelector('input:not([readonly])') || box.querySelector('input');
+    if (first) setTimeout(() => { try { first.focus(); first.select(); } catch (e) {} }, 30);
+  });
+}
 (function bindAskModal() {
   const m = $('#askModal');
   if (!m) return;
@@ -74,7 +117,1179 @@ const askPrompt = (msg, def) => askModal({ msg, def, input: true });
   m.onclick = (e) => { if (e.target === m) done($('#askInputWrap').classList.contains('hide') ? false : null); };
 })();
 
-const S = { machines: [], machineId: 'local', disks: [], sel: null, settings: null, cfg: {}, tabs: [], activeTab: null, jobES: null, termES: null, me: null, checked: new Set(), termMachine: 'local' };
+const S = { machines: [], machineId: 'local', machineIps: {}, ipExpand: new Set(), sort: [], disks: [], sel: null, settings: null, cfg: {}, tabs: [], activeTab: null, jobES: null, termES: null, me: null, checked: new Set(), termMachine: 'local' };
+try { S.sort = JSON.parse(localStorage.getItem('dw_sort') || '[]') || []; } catch (e) { S.sort = []; }
+
+/* ================= 机器列表：排序/筛选/视图/选择/统计/导出（2026-09-24 全面版 v2） ================= */
+const COLS = [
+  { key: 'name', label: '名称', w: 170, filter: true },
+  { key: 'ip', label: 'IP', w: 210, filter: true },
+  { key: 'port', label: '端口', w: 70, filter: true },
+  { key: 'rack', label: '机房/机架', w: 100, filter: true },
+  { key: 'status', label: '状态', w: 90, filter: true },
+  { key: 'lastCheck', label: '最后检测', w: 150, filter: false },
+  { key: 'note', label: '备注', w: 180, filter: true }
+];
+const OPS_COL = { key: 'ops', label: '操作', w: 300, filter: false };
+const SEL_COL = { key: '__sel', label: '', w: 38, filter: false };
+const STATUS_RANK = { online: 0, unknown: 1, offline: 2 };
+const STATUS_TEXT = { online: '在线', offline: '离线', unknown: '未知' };
+const STATUS_RAW = { '在线': 'online', '离线': 'offline', '未知': 'unknown' };
+const TBL_DEFAULT = {
+  sort: [], opts: { collation: 'pinyin', caseSensitive: false, blanksLast: true },
+  seq: {}, colOrder: COLS.map((c) => c.key), colW: {}, hidden: [], onlineFirst: false,
+  filters: {}, q: '', chip: 'all', density: 'cozy', views: {}, defaultView: '', me: '', pageSize: 300, page: 1
+};
+S.tbl = JSON.parse(JSON.stringify(TBL_DEFAULT));
+S.sel = new Set();
+S.cursor = null;
+try {
+  const _l = JSON.parse(localStorage.getItem('dw_tbl') || 'null');
+  if (_l) S.tbl = Object.assign(S.tbl, _l);
+} catch (e) { S.tbl = JSON.parse(JSON.stringify(TBL_DEFAULT)); }
+
+function colByKey(k) {
+  if (k === 'ops') return OPS_COL;
+  if (k === '__sel') return SEL_COL;
+  return COLS.find((c) => c.key === k) || null;
+}
+function colOrderFull() {
+  const o = (S.tbl.colOrder || []).map(colByKey).filter(Boolean);
+  for (const c of COLS) if (o.indexOf(c) < 0) o.push(c);
+  o.push(OPS_COL);
+  return o;
+}
+function visibleCols() {
+  return [SEL_COL].concat(colOrderFull().filter((c) => c.key === 'ops' || S.tbl.hidden.indexOf(c.key) < 0));
+}
+function colWidth(c) { return (S.tbl.colW && S.tbl.colW[c.key] ? S.tbl.colW[c.key] : (c.w || 120)) + 'px'; }
+
+/* ---------- 偏好存取（服务端按用户 + 本地兜底） ---------- */
+let _tblTimer = null;
+function tblSnapshot() {
+  return {
+    sort: S.tbl.sort, opts: S.tbl.opts, seq: S.tbl.seq, colOrder: S.tbl.colOrder, colW: S.tbl.colW,
+    hidden: S.tbl.hidden, onlineFirst: S.tbl.onlineFirst, filters: S.tbl.filters, q: S.tbl.q,
+    chip: S.tbl.chip, density: S.tbl.density, views: S.tbl.views, defaultView: S.tbl.defaultView
+  };
+}
+function persistTbl() {
+  try { localStorage.setItem('dw_tbl', JSON.stringify(tblSnapshot())); } catch (e) {}
+  clearTimeout(_tblTimer);
+  _tblTimer = setTimeout(() => { api('/tableprefs', 'PUT', { mine: tblSnapshot() }).catch(() => {}); }, 600);
+}
+async function loadTblPrefs() {
+  try {
+    const r = await api('/tableprefs');
+    if (r) {
+      S.tbl.user = r.user || '';
+      const src = r.mine || r.shared || null;
+      if (src) {
+        S.tbl = Object.assign(JSON.parse(JSON.stringify(TBL_DEFAULT)), src);
+        try { localStorage.setItem('dw_tbl', JSON.stringify(tblSnapshot())); } catch (e) {}
+      }
+      if (src && src.defaultView && src.views && src.views[src.defaultView]) applyView(src.defaultView, false);
+    }
+  } catch (e) {}
+}
+function saveSharedTbl() { api('/tableprefs', 'PUT', { shared: tblSnapshot() }).then(() => toast('已把当前设置设为全站默认')).catch(() => {}); }
+
+/* ---------- 取值 / 比较（类型化 + 自定义序列 + 空白置末） ---------- */
+function ipToNum(s) { return String(s || '').split('.').reduce((a, b) => a * 256 + (parseInt(b, 10) || 0), 0); }
+function rawVal(m, key) {
+  if (key === 'ip') return ipToNum(m.ip);
+  if (key === 'port') return Number(m.port) || 0;
+  if (key === 'lastCheck') return Number(m.lastCheck) || 0;
+  if (key === 'status') return STATUS_RANK[m.status] === undefined ? 1 : STATUS_RANK[m.status];
+  return String(m[key] === undefined || m[key] === null ? '' : m[key]);
+}
+function dispVal(m, key) {
+  if (key === 'status') return STATUS_TEXT[m.status] || '未知';
+  if (key === 'lastCheck') return m.lastCheck ? new Date(m.lastCheck).toLocaleString('zh-CN', { hour12: false }) : '';
+  if (key === 'ip') return String(m.ip || '');
+  return String(m[key] === undefined || m[key] === null ? '' : m[key]);
+}
+function isBlank(m, key) {
+  if (key === 'lastCheck') return !m.lastCheck;
+  if (key === 'ip' || key === 'port' || key === 'status') return false;
+  return String(m[key] === undefined || m[key] === null ? '' : m[key]).trim() === '';
+}
+let _coll = null, _collKey = '';
+function getCollator() {
+  const o = S.tbl.opts || {};
+  const key = (o.collation || 'none') + '|' + (o.caseSensitive ? 1 : 0);
+  if (_coll && _collKey === key) return _coll;
+  let loc = 'zh-Hans-CN';
+  if (o.collation === 'pinyin') loc = 'zh-Hans-CN-u-co-pinyin';
+  else if (o.collation === 'stroke') loc = 'zh-Hans-CN-u-co-stroke';
+  try { _coll = new Intl.Collator(loc, { numeric: true, sensitivity: o.caseSensitive ? 'variant' : 'base' }); }
+  catch (e) { _coll = new Intl.Collator('zh-Hans-CN', { numeric: true }); }
+  _collKey = key;
+  return _coll;
+}
+function cmpBy(a, b, s) {
+  const o = S.tbl.opts || {};
+  const ba = isBlank(a, s.key), bb = isBlank(b, s.key);
+  if (o.blanksLast !== false) {
+    if (ba && !bb) return 1;
+    if (!ba && bb) return -1;
+    if (ba && bb) return 0;
+  }
+  const seq = (S.tbl.seq || {})[s.key];
+  if (seq && seq.length) {
+    const sv = (m, k) => (k === 'status' ? String(m.status || '') : (k === 'lastCheck' ? String(m.lastCheck || '') : String(m[k] === undefined || m[k] === null ? '' : m[k]).trim()));
+    const ia = seq.indexOf(sv(a, s.key));
+    const ib = seq.indexOf(sv(b, s.key));
+    const ra = ia < 0 ? seq.length + 1 : ia, rb = ib < 0 ? seq.length + 1 : ib;
+    if (ra !== rb) return (ra - rb) * s.dir;
+    return 0;
+  }
+  const va = rawVal(a, s.key), vb = rawVal(b, s.key);
+  let r;
+  if (typeof va === 'number' && typeof vb === 'number') r = va - vb;
+  else r = getCollator().compare(String(va), String(vb));
+  return r * s.dir;
+}
+
+/* ---------- 筛选 / 搜索 / 视图数据 ---------- */
+function chipMatch(m) {
+  const c = S.tbl.chip || 'all';
+  if (c === 'all') return true;
+  if (c === 'local') return !!m.local;
+  if (c === 'multiip') return ((S.machineIps && S.machineIps[m.id]) || m.ips || []).length > 1;
+  return m.status === c;
+}
+function colFilterMatch(m) {
+  const f = S.tbl.filters || {};
+  for (const key of Object.keys(f)) {
+    const allow = f[key];
+    if (!allow || !allow.length) continue;
+    const v = key === 'status' ? (STATUS_TEXT[m.status] || '未知') : String(dispVal(m, key));
+    if (allow.indexOf(v) < 0) return false;
+  }
+  return true;
+}
+function qMatch(m) {
+  const q = (S.tbl.q || '').trim().toLowerCase();
+  if (!q) return true;
+  const hay = [m.name, m.ip, m.rack, m.note, STATUS_TEXT[m.status] || '', m.port].join(' ').toLowerCase();
+  return hay.indexOf(q) >= 0;
+}
+function filteredMachines() { return S.machines.filter((m) => chipMatch(m) && colFilterMatch(m) && qMatch(m)); }
+function viewData() {
+  const list = filteredMachines();
+  if (S.tbl.onlineFirst) {
+    list.sort((x, y) => (STATUS_RANK[x.status] === undefined ? 1 : STATUS_RANK[x.status]) - (STATUS_RANK[y.status] === undefined ? 1 : STATUS_RANK[y.status]));
+  }
+  if (!S.tbl.sort.length) return list;
+  return list.map((m, i) => ({ m, i })).sort((x, y) => {
+    for (const s of S.tbl.sort) { const r = cmpBy(x.m, y.m, s); if (r) return r; }
+    return x.i - y.i;
+  }).map((o) => o.m);
+}
+function hl(text) {
+  const q = (S.tbl.q || '').trim();
+  const s = esc(String(text === undefined || text === null ? '' : text));
+  if (!q) return s;
+  try { return s.replace(new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi'), '<mark>$1</mark>'); }
+  catch (e) { return s; }
+}
+
+/* ---------- 排序操作 ---------- */
+function sortDesc() {
+  return S.tbl.sort.map((s, i) => `${colByKey(s.key) ? colByKey(s.key).label : s.key}${s.dir === 1 ? ' ↑' : ' ↓'}${(S.tbl.seq || {})[s.key] ? '(自定义序列)' : ''}`).join(' → ');
+}
+function updateSortBar() {
+  const bar = $('#sortBar');
+  if (!bar) return;
+  const bits = [];
+  if (S.tbl.sort.length) bits.push('排序：' + sortDesc());
+  if (S.tbl.chip && S.tbl.chip !== 'all') bits.push('快速筛选：' + ({ online: '在线', offline: '离线', unknown: '未知', local: '本机', multiip: '多IP' })[S.tbl.chip]);
+  const fk = Object.keys(S.tbl.filters || {}).filter((k) => (S.tbl.filters[k] || []).length);
+  if (fk.length) bits.push('列筛选：' + fk.map((k) => (colByKey(k) ? colByKey(k).label : k) + '×' + S.tbl.filters[k].length).join('、'));
+  if (S.tbl.q) bits.push('搜索：“' + S.tbl.q + '”');
+  if (S.tbl.onlineFirst) bits.push('置顶在线');
+  bar.textContent = bits.length ? bits.join('　|　') : '未排序（点表头即可排序）';
+  bar.style.color = bits.length ? 'var(--blue)' : '';
+  const clr = $('#btnClearAll');
+  if (clr) clr.classList.toggle('hide', bits.length === 0);
+}
+function setTblSort(list) { S.tbl.sort = list || []; S.tbl.page = 1; persistTbl(); renderMachineTable(); }
+function toggleSort(key, additive) {
+  const cur = S.tbl.sort.find((s) => s.key === key);
+  if (additive) {
+    if (!cur) return setTblSort(S.tbl.sort.concat([{ key, dir: 1 }]));
+    return setTblSort(S.tbl.sort.map((s) => (s.key === key ? { key, dir: -s.dir } : s)));
+  }
+  if (!cur) setTblSort([{ key, dir: 1 }]);
+  else if (S.tbl.sort.length === 1 && cur.dir === 1) setTblSort([{ key, dir: -1 }]);
+  else if (S.tbl.sort.length === 1 && cur.dir === -1) setTblSort([]);
+  else setTblSort(S.tbl.sort.map((s) => (s.key === key ? { key, dir: -s.dir } : s)));
+}
+
+/* ---------- IP 单元格（主 IP + N 个 IP 徽标 + 其余折叠，悬停小窗） ---------- */
+function ipCell(m) {
+  const cached = (S.machineIps && S.machineIps[m.id]) || m.ips || [];
+  const ips = cached.length ? cached.slice() : [m.ip];
+  if (m.ip && ips.indexOf(m.ip) < 0) ips.unshift(m.ip);
+  const main = m.ip || ips[0];
+  const extra = ips.filter((x) => x !== main);
+  if (!extra.length) return `<span style="font-family:var(--mono)">${hl(main)}</span>`;
+  const show = extra.slice(0, 1);
+  const more = extra.length - show.length;
+  let tail = show.map((x) => hl(x)).join(' ');
+  if (more > 0) tail += ` <span class="chip">+${more}</span>`;
+  const data = esc(ips.join(','));
+  return `<span style="font-family:var(--mono)">${hl(main)}</span> <span class="chip" data-ippop="${data}">${ips.length} 个 IP</span>`
+    + `<div class="muted small" data-ippop="${data}" style="line-height:1.3;cursor:help">+ ${tail}</div>`;
+}
+function showIpPop(el) {
+  const pop = $('#ipPop');
+  if (!pop) return;
+  const ips = (el.dataset.ippop || '').split(',').filter(Boolean);
+  if (!ips.length) return;
+  pop.innerHTML = `<div class="t">该机器共 ${ips.length} 个 IP（点击复制）</div>` + ips.map((x) => `<div data-copy="${esc(x)}">${esc(x)}</div>`).join('');
+  pop.classList.remove('hide');
+  pop.style.pointerEvents = 'auto';
+  const r = el.getBoundingClientRect();
+  const w = pop.offsetWidth, h = pop.offsetHeight;
+  let left = Math.min(r.left, window.innerWidth - w - 8);
+  let top = r.bottom + 6;
+  if (top + h + 8 > window.innerHeight) top = Math.max(6, r.top - h - 6);
+  pop.style.left = Math.max(6, left) + 'px';
+  pop.style.top = Math.max(6, top) + 'px';
+  $$('#ipPop [data-copy]').forEach((d) => d.onclick = () => { copyText(d.dataset.copy); toast('已复制 ' + d.dataset.copy); });
+}
+function hideIpPop() { const p = $('#ipPop'); if (p) p.classList.add('hide'); }
+
+/* ---------- 单元格渲染 ---------- */
+function cellHtml(m, key) {
+  if (key === '__sel') return `<input type="checkbox" class="rowsel" data-id="${m.id}"${S.sel.has(m.id) ? ' checked' : ''}>`;
+  if (key === 'name') return `${hl(m.name)}${m.local ? ' <span class="chip sys">本机</span>' : ''}`;
+  if (key === 'ip') return ipCell(m);
+  if (key === 'port') return hl(m.port === undefined || m.port === null ? '' : m.port);
+  if (key === 'rack') return `<span class="muted small">${hl(m.rack || '')}</span>`;
+  if (key === 'status') return `<span class="dot ${m.status === 'online' ? 'on' : m.status === 'offline' ? 'off' : ''}"></span> ${STATUS_TEXT[m.status] || '未知'}`;
+  if (key === 'lastCheck') return `<span class="muted small">${hl(dispVal(m, 'lastCheck') || '-')}</span>`;
+  if (key === 'note') return `<span class="muted small">${hl(m.note || '')}</span>`;
+  if (key === 'ops') return `<button class="btn small" data-act="test" data-id="${m.id}">连接测试</button>
+      <button class="btn small" data-act="open" data-id="${m.id}">打开页面</button>
+      <button class="btn small" data-act="edit" data-id="${m.id}">编辑</button>`;
+  return '';
+}
+function rowClass(m) {
+  const c = ['mrow'];
+  if (m.local) c.push('row-local');
+  if (m.status === 'offline') c.push('row-offline');
+  else if (m.status !== 'online') c.push('row-unknown');
+  if (S.cursor === m.id) c.push('row-cursor');
+  return c.join(' ');
+}
+function renderMachineTable() {
+  renderMachineHead();
+  const cols = visibleCols();
+  const all = viewData();
+  const size = S._printAll ? all.length : (Number(S.tbl.pageSize) > 0 ? Number(S.tbl.pageSize) : all.length);
+  const pages = Math.max(1, Math.ceil(all.length / Math.max(1, size)));
+  if (!S.tbl.page || S.tbl.page < 1) S.tbl.page = 1;
+  if (S.tbl.page > pages) S.tbl.page = pages;
+  const start = (S.tbl.page - 1) * size;
+  const rows = all.slice(start, start + size);
+  $('#machineRows').innerHTML = rows.map((m) => `<tr class="${rowClass(m)}" data-mid="${m.id}">${cols.map((c) => {
+    if (c.key === 'ops') return `<td>${cellHtml(m, 'ops')}${m.local ? '' : ` <button class="btn small" data-act="del" data-id="${m.id}">删除</button>`}</td>`;
+    return `<td style="width:${colWidth(c)}">${cellHtml(m, c.key)}</td>`;
+  }).join('')}</tr>`).join('') || `<tr><td colspan="${cols.length}" class="muted" style="text-align:center;padding:14px">没有符合条件的数据</td></tr>`;
+  $$('#machineRows .btn').forEach((b) => b.onclick = (ev) => { ev.stopPropagation(); machineAction(b.dataset.act, b.dataset.id); });
+  $$('#machineRows [data-ippop]').forEach((el) => {
+    el.onmouseenter = () => showIpPop(el);
+    el.onmouseleave = () => { const p = $('#ipPop'); if (p && !p.matches(':hover')) hideIpPop(); };
+  });
+  $$('#machineRows .rowsel').forEach((c) => c.onclick = (ev) => {
+    ev.stopPropagation();
+    const id = c.dataset.id;
+    if (c.checked) S.sel.add(id); else S.sel.delete(id);
+    renderStats();
+  });
+  const selAllBox = $('#selAll');
+  if (selAllBox) selAllBox.onclick = () => {
+    if (selAllBox.checked) rows.forEach((m) => S.sel.add(m.id)); else rows.forEach((m) => S.sel.delete(m.id));
+    renderMachineTable();
+  };
+  $$('#machineRows tr[data-mid]').forEach((tr) => {
+    tr.onclick = () => { S.cursor = tr.dataset.mid; $$('#machineRows tr').forEach((x) => x.classList.toggle('row-cursor', x === tr)); renderStats(); };
+    tr.ondblclick = () => machineAction('open', tr.dataset.mid);
+  });
+  renderStats();
+  renderPager(all.length, pages, start, rows.length);
+  updateSortBar();
+  if (S._syncOnlineBtn) S._syncOnlineBtn();
+  updateSvc();
+}
+function renderPager(total, pages, start, shown) {
+  const el = $('#pager');
+  if (!el) return;
+  const size = Number(S.tbl.pageSize) > 0 ? Number(S.tbl.pageSize) : total;
+  el.classList.toggle('hide', total <= size);
+  if (total <= size) { el.innerHTML = ''; return; }
+  el.innerHTML = `共 ${total} 条 · 第 ${S.tbl.page}/${pages} 页 · 本页显示 ${start + 1}-${start + shown}　
+    <button class="btn small" data-pg="first">⏮ 首页</button>
+    <button class="btn small" data-pg="prev">‹ 上一页</button>
+    <button class="btn small" data-pg="next">下一页 ›</button>
+    <button class="btn small" data-pg="last">尾页 ⏭</button>
+    <span class="muted small">每页</span>
+    <select id="pgSize" class="pg-sel">${[100, 200, 300, 500, 1000, 0].map((n) => `<option value="${n}"${Number(S.tbl.pageSize) === n ? ' selected' : ''}>${n === 0 ? '全部' : n}</option>`).join('')}</select>`;
+  $$('#pager .btn').forEach((b) => b.onclick = () => {
+    const a = b.dataset.pg;
+    if (a === 'first') S.tbl.page = 1;
+    else if (a === 'prev') S.tbl.page = Math.max(1, S.tbl.page - 1);
+    else if (a === 'next') S.tbl.page = Math.min(pages, S.tbl.page + 1);
+    else if (a === 'last') S.tbl.page = pages;
+    const tw = $('.tablewrap'); if (tw) tw.scrollTop = 0;
+    renderMachineTable();
+  });
+  const ps = $('#pgSize');
+  if (ps) ps.onchange = () => { S.tbl.pageSize = Number(ps.value); S.tbl.page = 1; persistTbl(); renderMachineTable(); };
+}
+function renderStats() {
+  const el = $('#tblStats');
+  if (!el) return;
+  const rows = viewData();
+  const on = rows.filter((m) => m.status === 'online').length;
+  const off = rows.filter((m) => m.status === 'offline').length;
+  const un = rows.length - on - off;
+  el.innerHTML = `共 <b>${S.machines.length}</b> 台 · 当前显示 <b>${rows.length}</b> · 在线 <b style="color:var(--green)">${on}</b> · 离线 <b style="color:var(--red)">${off}</b> · 未知 <b>${un}</b> ｜ 已选 <b>${S.sel.size}</b>`;
+  const bb = $('#batchBar');
+  if (bb) bb.classList.toggle('hide', S.sel.size === 0);
+}
+
+/* ---------- 表头（排序图标 / 筛选按钮 / 拖拽列序 / 拖拽列宽 / 右键菜单） ---------- */
+function renderMachineHead() {
+  const tr = $('#machineHead');
+  if (!tr) return;
+  tr.innerHTML = visibleCols().map((c) => {
+    if (c.key === '__sel') return `<th class="selcol"><input type="checkbox" id="selAll" title="全选当前显示的机器"></th>`;
+    const sortable = c.key !== 'ops';
+    if (!sortable) return `<th data-colkey="ops" style="width:${colWidth(c)}">${c.label}</th>`;
+    const idx = S.tbl.sort.findIndex((s) => s.key === c.key);
+    const cur = idx >= 0 ? S.tbl.sort[idx] : null;
+    const caret = `<span class="caret">${cur ? (cur.dir === 1 ? '▲' : '▼') : '⇅'}</span>`;
+    const badge = (S.tbl.sort.length > 1 && idx >= 0) ? `<span class="chip" style="margin-left:2px">${idx + 1}</span>` : '';
+    const fActive = (S.tbl.filters && S.tbl.filters[c.key] && S.tbl.filters[c.key].length) ? ' f-on' : '';
+    const fbtn = c.filter ? `<button class="fbtn${fActive}" data-fbtn="${c.key}" title="筛选">▾</button>` : '<button class="sortmore" title="自定义排序">▾</button>';
+    const tip = '单击排序（升→降→取消）；Shift+单击=追加次要条件；右键=更多';
+    return `<th data-colkey="${c.key}" draggable="true" style="width:${colWidth(c)}" title="${tip}">${c.label}${badge}${caret}${fbtn}<span class="rz" data-rz="${c.key}"></span></th>`;
+  }).join('');
+  $$('#machineHead th[data-colkey]').forEach((th) => {
+    const key = th.dataset.colkey;
+    if (key === 'ops') return;
+    th.onclick = (ev) => {
+      if (ev.target && (ev.target.classList.contains('sortmore') || ev.target.classList.contains('fbtn') || ev.target.classList.contains('rz'))) return;
+      toggleSort(key, ev.shiftKey);
+    };
+    th.oncontextmenu = (ev) => { ev.preventDefault(); openThMenu(ev, key); };
+    const sm = th.querySelector('.sortmore');
+    if (sm) sm.onclick = (ev) => { ev.stopPropagation(); openSortPop(sm); };
+    const fb = th.querySelector('.fbtn');
+    if (fb) fb.onclick = (ev) => { ev.stopPropagation(); openFilterPop(fb, key); };
+    const rz = th.querySelector('.rz');
+    if (rz) {
+      rz.onmousedown = (ev) => startResize(ev, th, key);
+      rz.ondblclick = (ev) => { ev.stopPropagation(); autoFitCol(th, key); };
+      rz.onclick = (ev) => ev.stopPropagation();
+    }
+    th.ondragstart = (ev) => { ev.dataTransfer.setData('text/plain', key); S._dragCol = key; th.classList.add('dragging'); };
+    th.ondragend = () => { S._dragCol = null; th.classList.remove('dragging'); };
+    th.ondragover = (ev) => { if (!S._dragCol || S._dragCol === key) return; ev.preventDefault(); th.classList.add('dropbefore'); };
+    th.ondragleave = () => th.classList.remove('dropbefore');
+    th.ondrop = (ev) => {
+      ev.preventDefault(); th.classList.remove('dropbefore');
+      const from = S._dragCol; if (!from || from === key) return;
+      const order = colOrderFull().map((c) => c.key).filter((k) => k !== 'ops' && k !== '__sel');
+      const fi = order.indexOf(from), ti = order.indexOf(key);
+      if (fi < 0 || ti < 0) return;
+      order.splice(fi, 1); order.splice(ti, 0, from);
+      S.tbl.colOrder = order; persistTbl(); renderMachineTable();
+    };
+  });
+}
+function startResize(ev, th, key) {
+  ev.preventDefault();
+  const startX = ev.clientX, startW = th.offsetWidth;
+  const move = (e) => { th.style.width = Math.max(50, startW + (e.clientX - startX)) + 'px'; };
+  const up = () => {
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    S.tbl.colW[key] = parseInt(th.style.width, 10) || th.offsetWidth;
+    persistTbl();
+  };
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+}
+function autoFitCol(th, key) {
+  const tbl = $('#machineTable');
+  if (!tbl) return;
+  let max = th.scrollWidth;
+  tbl.querySelectorAll('tbody tr').forEach((r, i) => {
+    const cell = r.children[i];
+    if (!cell || !cell.innerText) return;
+    const span = document.createElement('span');
+    span.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;font:' + getComputedStyle(cell).font;
+    span.textContent = cell.innerText;
+    document.body.appendChild(span);
+    const w = span.offsetWidth + 26;
+    span.remove();
+    if (w > max) max = w;
+  });
+  S.tbl.colW[key] = Math.min(600, Math.max(50, Math.round(max)));
+  persistTbl(); renderMachineTable();
+}
+
+/* ---------- 表头右键菜单 ---------- */
+function openThMenu(ev, key) {
+  const menu = $('#thMenu');
+  if (!menu) return;
+  const label = colByKey(key) ? colByKey(key).label : key;
+  menu.innerHTML = `<div data-act="asc">${esc(label)}：升序 ↑</div>
+    <div data-act="desc">${esc(label)}：降序 ↓</div>
+    <div data-act="add">追加为次要条件</div>
+    <div class="sep"></div>
+    <div data-act="filter">筛选该列…</div>
+    <div data-act="custom">自定义排序…</div>
+    <div data-act="clear">清除排序</div>
+    <div data-act="clearall">清除全部排序与筛选</div>`;
+  menu.classList.remove('hide');
+  menu.style.left = Math.min(ev.clientX, window.innerWidth - menu.offsetWidth - 8) + 'px';
+  menu.style.top = Math.min(ev.clientY, window.innerHeight - menu.offsetHeight - 8) + 'px';
+  $$('#thMenu div[data-act]').forEach((d) => d.onclick = () => {
+    const a = d.dataset.act; menu.classList.add('hide');
+    if (a === 'asc') setTblSort([{ key, dir: 1 }]);
+    else if (a === 'desc') setTblSort([{ key, dir: -1 }]);
+    else if (a === 'add') setTblSort(S.tbl.sort.concat([{ key, dir: 1 }]));
+    else if (a === 'filter') openFilterPop($('#machineHead .fbtn[data-fbtn="' + key + '"]'), key);
+    else if (a === 'custom') openSortPop($('#machineHead th[data-colkey="' + key + '"] .sortmore'));
+    else if (a === 'clear') setTblSort([]);
+    else if (a === 'clearall') clearAll();
+  });
+}
+document.addEventListener('click', (e) => {
+  const m = $('#thMenu');
+  if (m && !m.classList.contains('hide') && !m.contains(e.target)) m.classList.add('hide');
+});
+
+/* ---------- 自定义排序弹窗 ---------- */
+function sortRowHtml(level, s) {
+  const names = ['主要关键字', '次要关键字', '第三关键字', '第四关键字', '第五关键字', '第六关键字', '第七关键字'];
+  const seq = (S.tbl.seq || {})[s.key] || [];
+  const shown = seq.map((v) => (s.key === 'status' ? (STATUS_TEXT[v] || v) : v));
+  return `<div class="sp-row" data-lv="${level}">
+    <span class="lb">${names[level] || '条件' + (level + 1)}</span>
+    <select class="sp-key">${COLS.map((c) => `<option value="${c.key}"${c.key === s.key ? ' selected' : ''}>${c.label}</option>`).join('')}</select>
+    <select class="sp-dir"><option value="1"${s.dir === 1 ? ' selected' : ''}>升序</option><option value="-1"${s.dir === -1 ? ' selected' : ''}>降序</option></select>
+    <input class="sp-seq" placeholder="自定义序列(可选)" value="${esc(shown.join(','))}" title="逗号分隔，按此顺序排；未列出的排最后。状态可填：在线,离线,未知">
+    <button class="btn small sp-del" title="删除该条件">✕</button>
+  </div>`;
+}
+function syncSortOptsToUi() {
+  const o = S.tbl.opts || {};
+  if ($('#spCollation')) $('#spCollation').value = o.collation || 'pinyin';
+  if ($('#spCase')) $('#spCase').checked = !!o.caseSensitive;
+  if ($('#spBlank')) $('#spBlank').checked = o.blanksLast !== false;
+}
+function renderSortRows(list) {
+  $('#spRows').innerHTML = list.map((s, i) => sortRowHtml(i, s)).join('');
+  $$('#spRows .sp-del').forEach((b) => b.onclick = () => {
+    const cur = collectSortPop();
+    cur.splice(Number(b.closest('.sp-row').dataset.lv), 1);
+    renderSortRows(cur);
+  });
+}
+function collectSortPop() {
+  const out = [];
+  $$('#spRows .sp-row').forEach((row) => {
+    const key = row.querySelector('.sp-key').value;
+    out.push({ key, dir: Number(row.querySelector('.sp-dir').value) || 1 });
+    const seqTxt = (row.querySelector('.sp-seq') || {}).value || '';
+    let seq = seqTxt.split(/[,，;；\s]+/).map((x) => x.trim()).filter(Boolean);
+    if (key === 'status') seq = seq.map((x) => STATUS_RAW[x] || x);
+    S.tbl.seq = S.tbl.seq || {};
+    if (seq.length) S.tbl.seq[key] = seq; else delete S.tbl.seq[key];
+  });
+  const o = S.tbl.opts || {};
+  if ($('#spCollation')) o.collation = $('#spCollation').value;
+  if ($('#spCase')) o.caseSensitive = $('#spCase').checked;
+  if ($('#spBlank')) o.blanksLast = $('#spBlank').checked;
+  S.tbl.opts = o;
+  return out;
+}
+function openSortPop(anchor) {
+  const pop = $('#sortPop');
+  if (!pop) return;
+  renderSortRows(S.tbl.sort.length ? S.tbl.sort : [{ key: 'name', dir: 1 }]);
+  syncSortOptsToUi();
+  pop.classList.remove('hide');
+  const r = (anchor || $('#machineHead') || document.body).getBoundingClientRect();
+  let left = Math.min(r.left, window.innerWidth - pop.offsetWidth - 8);
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight + 8 > window.innerHeight) top = Math.max(8, r.top - pop.offsetHeight - 6);
+  pop.style.left = Math.max(8, left) + 'px';
+  pop.style.top = top + 'px';
+}
+(function bindSortPop() {
+  const pop = $('#sortPop');
+  if (!pop) return;
+  $('#spAdd').onclick = () => {
+    const cur = collectSortPop();
+    if (cur.length >= COLS.length) return toast('最多 ' + COLS.length + ' 个条件');
+    const used = cur.map((s) => s.key);
+    const next = COLS.find((c) => used.indexOf(c.key) < 0) || COLS[0];
+    cur.push({ key: next.key, dir: 1 });
+    renderSortRows(cur);
+  };
+  $('#spOpt').onclick = () => { const b = $('#spOptBox'); if (b) b.classList.toggle('hide'); };
+  $('#spClear').onclick = () => { pop.classList.add('hide'); setTblSort([]); toast('已清除排序'); };
+  $('#spOk').onclick = () => { pop.classList.add('hide'); setTblSort(collectSortPop()); toast('排序已应用'); };
+  document.addEventListener('click', (e) => {
+    if (pop.classList.contains('hide')) return;
+    if (pop.contains(e.target) || (e.target.closest && e.target.closest('.sortmore'))) return;
+    pop.classList.add('hide');
+  });
+})();
+
+/* ---------- 列筛选弹窗 ---------- */
+function distinctValues(key) {
+  const set = new Map();
+  for (const m of S.machines) {
+    const v = key === 'status' ? (STATUS_TEXT[m.status] || '未知') : String(dispVal(m, key));
+    set.set(v, (set.get(v) || 0) + 1);
+  }
+  return Array.from(set.entries()).sort((a, b) => getCollator().compare(a[0], b[0]));
+}
+function openFilterPop(anchor, key) {
+  const pop = $('#filterPop');
+  if (!pop || !anchor) return;
+  const cur = (S.tbl.filters || {})[key] || [];
+  const vals = distinctValues(key);
+  pop.dataset.key = key;
+  pop.innerHTML = `<div class="sp-head">筛选：${esc(colByKey(key) ? colByKey(key).label : key)}</div>
+    <input id="fpQ" class="fp-q" placeholder="搜索值…">
+    <div class="fp-tools"><a id="fpAll">全选</a><a id="fpNone">清空</a><a id="fpInv">反选</a></div>
+    <div class="fp-list" id="fpList">${vals.map(([v, n]) => `<label><input type="checkbox" class="fp-cb" value="${esc(v)}"${cur.length === 0 || cur.indexOf(v) >= 0 ? ' checked' : ''}> <span>${esc(v) || '(空)'}</span> <span class="muted small">(${n})</span></label>`).join('')}</div>
+    <div class="sp-foot"><button class="btn small" id="fpClear">清除该列筛选</button><span class="spacer"></span><button class="btn small" id="fpCancel">取消</button><button class="btn small primary" id="fpOk">确定</button></div>`;
+  pop.classList.remove('hide');
+  const r = anchor.getBoundingClientRect();
+  let left = Math.min(r.left - 60, window.innerWidth - pop.offsetWidth - 8);
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight + 8 > window.innerHeight) top = Math.max(8, r.top - pop.offsetHeight - 6);
+  pop.style.left = Math.max(8, left) + 'px';
+  pop.style.top = top + 'px';
+  const cbs = () => $$('#fpList .fp-cb');
+  $('#fpQ').oninput = (e) => {
+    const q = e.target.value.toLowerCase();
+    $$('#fpList label').forEach((l) => { l.style.display = l.innerText.toLowerCase().indexOf(q) >= 0 ? '' : 'none'; });
+  };
+  $('#fpAll').onclick = () => cbs().forEach((c) => c.checked = true);
+  $('#fpNone').onclick = () => cbs().forEach((c) => c.checked = false);
+  $('#fpInv').onclick = () => cbs().forEach((c) => c.checked = !c.checked);
+  $('#fpClear').onclick = () => { delete S.tbl.filters[key]; S.tbl.page = 1; pop.classList.add('hide'); persistTbl(); renderMachineTable(); toast('已清除该列筛选'); };
+  $('#fpCancel').onclick = () => pop.classList.add('hide');
+  $('#fpOk').onclick = () => {
+    const all = cbs().length;
+    const picked = cbs().filter((c) => c.checked).map((c) => c.value);
+    S.tbl.filters = S.tbl.filters || {};
+    if (picked.length === all) delete S.tbl.filters[key]; else S.tbl.filters[key] = picked;
+    S.tbl.page = 1;
+    pop.classList.add('hide'); persistTbl(); renderMachineTable();
+    toast(picked.length === all ? '已清除该列筛选' : `筛选 ${colByKey(key).label}：${picked.length} 个值`);
+  };
+  document.addEventListener('click', function once(e) {
+    if (pop.classList.contains('hide')) { document.removeEventListener('click', once); return; }
+    if (pop.contains(e.target) || (e.target.closest && e.target.closest('.fbtn'))) return;
+    pop.classList.add('hide');
+    document.removeEventListener('click', once);
+  });
+}
+
+/* ---------- 列表设置（列显隐 / 恢复默认） ---------- */
+function openColPop(anchor) {
+  const pop = $('#colPop');
+  if (!pop) return;
+  $('#colRows').innerHTML = COLS.map((c) => `<label class="f" style="display:block;margin-bottom:4px"><input type="checkbox" class="col-chk" value="${c.key}"${S.tbl.hidden.indexOf(c.key) < 0 ? ' checked' : ''}> ${c.label}</label>`).join('')
+    + '<div class="muted small" style="margin-top:6px">拖动表头可换列序；拖边界改列宽；双击边界=自动宽度</div>';
+  pop.classList.remove('hide');
+  const r = (anchor || document.body).getBoundingClientRect();
+  let left = Math.min(r.left - 200, window.innerWidth - pop.offsetWidth - 8);
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight + 8 > window.innerHeight) top = Math.max(8, r.top - pop.offsetHeight - 6);
+  pop.style.left = Math.max(8, left) + 'px';
+  pop.style.top = top + 'px';
+}
+(function bindColPop() {
+  const pop = $('#colPop');
+  if (!pop) return;
+  $('#colOk').onclick = () => {
+    const hidden = [];
+    $$('#colRows .col-chk').forEach((c) => { if (!c.checked) hidden.push(c.value); });
+    if (hidden.length >= COLS.length) { toast('至少要显示一列'); return; }
+    S.tbl.hidden = hidden; pop.classList.add('hide'); persistTbl(); renderMachineTable();
+  };
+  $('#colReset').onclick = () => {
+    S.tbl.hidden = []; S.tbl.colOrder = COLS.map((c) => c.key); S.tbl.colW = {};
+    pop.classList.add('hide'); persistTbl(); renderMachineTable(); toast('已恢复默认列设置');
+  };
+  document.addEventListener('click', (e) => {
+    if (pop.classList.contains('hide')) return;
+    if (pop.contains(e.target) || (e.target.closest && e.target.closest('#btnCols'))) return;
+    pop.classList.add('hide');
+  });
+})();
+
+/* ---------- 视图（命名视图：排序+筛选+列布局+密度） ---------- */
+function viewSnapshot() {
+  const t = tblSnapshot();
+  delete t.views; delete t.defaultView; delete t.user;   /* 视图快照不能包含 views 自身（否则循环引用 → JSON 序列化报错） */
+  return t;
+}
+function applyView(name, doRender) {
+  const v = (S.tbl.views || {})[name];
+  if (!v) return toast('视图不存在');
+  const clean = {};
+  for (const k of ['sort', 'opts', 'seq', 'colOrder', 'colW', 'hidden', 'onlineFirst', 'filters', 'q', 'chip', 'density']) {
+    if (v[k] !== undefined) clean[k] = JSON.parse(JSON.stringify(v[k]));
+  }
+  S.tbl = Object.assign(S.tbl, clean);
+  if (doRender !== false) { persistTbl(); renderMachineTable(); toast('已应用视图：' + name); }
+}
+function openViewPop(anchor) {
+  const pop = $('#viewPop');
+  if (!pop) return;
+  const names = Object.keys(S.tbl.views || {});
+  pop.innerHTML = `<div class="sp-head">视图（排序+筛选+列布局 打包保存）</div>
+    <div class="sp-row"><input id="vwName" placeholder="视图名称，如：只看在线" style="flex:1"><button class="btn small primary" id="vwSave">保存当前为新视图</button></div>
+    <div class="sp-tip muted small">当前默认视图：${esc(S.tbl.defaultView || '（无）')}</div>
+    <div class="fp-list">${names.length ? names.map((n) => `<div class="vw-row" data-n="${esc(n)}">
+      <span style="flex:1">${esc(n)}${S.tbl.defaultView === n ? ' <span class="chip ok">默认</span>' : ''}</span>
+      <button class="btn small" data-vw="apply">应用</button>
+      <button class="btn small" data-vw="def">设为默认</button>
+      <button class="btn small" data-vw="del">删除</button></div>`).join('') : '<div class="muted small">（还没有视图）</div>'}</div>
+    <div class="sp-foot"><button class="btn small" id="vwShared">把当前设置设为全站默认</button><span class="spacer"></span><button class="btn small" id="vwClose">关闭</button></div>`;
+  pop.classList.remove('hide');
+  const r = (anchor || document.body).getBoundingClientRect();
+  let left = Math.min(r.left - 240, window.innerWidth - pop.offsetWidth - 8);
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight + 8 > window.innerHeight) top = Math.max(8, r.top - pop.offsetHeight - 6);
+  pop.style.left = Math.max(8, left) + 'px';
+  pop.style.top = top + 'px';
+  $('#vwSave').onclick = () => {
+    const n = ($('#vwName').value || '').trim();
+    if (!n) return toast('请填视图名称');
+    S.tbl.views = S.tbl.views || {};
+    S.tbl.views[n] = viewSnapshot();
+    persistTbl(); openViewPop(anchor); toast('已保存视图：' + n); renderViewSelect();
+  };
+  $$('#viewPop .vw-row').forEach((row) => {
+    const n = row.dataset.n;
+    $$('#viewPop .vw-row[data-n="' + n + '"] button').forEach((b) => b.onclick = () => {
+      const a = b.dataset.vw;
+      if (a === 'apply') { applyView(n); pop.classList.add('hide'); }
+      else if (a === 'def') { S.tbl.defaultView = n; persistTbl(); openViewPop(anchor); toast('已设为默认视图：' + n); }
+      else if (a === 'del') { delete S.tbl.views[n]; if (S.tbl.defaultView === n) S.tbl.defaultView = ''; persistTbl(); openViewPop(anchor); toast('已删除视图：' + n); renderViewSelect(); }
+    });
+  });
+  $('#vwShared').onclick = () => saveSharedTbl();
+  $('#vwClose').onclick = () => pop.classList.add('hide');
+  document.addEventListener('click', function once(e) {
+    if (pop.classList.contains('hide')) { document.removeEventListener('click', once); return; }
+    if (pop.contains(e.target) || (e.target.closest && e.target.closest('#btnViews'))) return;
+    pop.classList.add('hide');
+    document.removeEventListener('click', once);
+  });
+}
+function renderViewSelect() {
+  const sel = $('#viewSel');
+  if (!sel) return;
+  const names = Object.keys(S.tbl.views || {});
+  sel.innerHTML = `<option value="">— 视图 —</option>` + names.map((n) => `<option value="${esc(n)}"${S.tbl.defaultView === n ? ' selected' : ''}>${esc(n)}</option>`).join('');
+  sel.onchange = () => { if (sel.value) applyView(sel.value); };
+}
+
+/* ---------- 选择 / 批量 / 剪贴板 / 导出 ---------- */
+function copyText(t) {
+  try { navigator.clipboard.writeText(t); return true; } catch (e) {
+    const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e2) {}
+    ta.remove(); return true;
+  }
+}
+function selectedMachines() { return viewData().filter((m) => S.sel.has(m.id)); }
+function exportCsv() {
+  const rows = viewData();
+  const head = ['名称', 'IP', '端口', '机房/机架', '状态', '最后检测', '备注'];
+  const lines = [head.join(',')];
+  for (const m of rows) {
+    lines.push([m.name, m.ip, m.port, m.rack || '', STATUS_TEXT[m.status] || '未知', dispVal(m, 'lastCheck'), m.note || '']
+      .map((x) => '"' + String(x).replace(/"/g, '""') + '"').join(','));
+  }
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '机器列表_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '') + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('已导出 CSV（' + rows.length + ' 行，按当前排序与筛选）');
+}
+function copyTsv() {
+  const list = S.sel.size ? selectedMachines() : viewData();
+  const head = ['名称', 'IP', '端口', '机房/机架', '状态', '最后检测', '备注'];
+  const lines = [head.join('\t')];
+  for (const m of list) lines.push([m.name, m.ip, m.port, m.rack || '', STATUS_TEXT[m.status] || '未知', dispVal(m, 'lastCheck'), m.note || ''].join('\t'));
+  copyText(lines.join('\n'));
+  toast('已复制 ' + list.length + ' 行（可直接粘进 Excel）');
+}
+function clearAll() {
+  S.tbl.sort = []; S.tbl.filters = {}; S.tbl.q = ''; S.tbl.chip = 'all'; S.tbl.onlineFirst = false; S.tbl.page = 1;
+  if ($('#tblQ')) $('#tblQ').value = '';
+  $$('.chip-btn').forEach((c) => c.classList.toggle('primary', c.dataset.chip === 'all'));
+  persistTbl(); renderMachineTable(); toast('已清除排序与筛选');
+}
+
+/* ---------- 工具栏 / 键盘绑定 ---------- */
+(function bindToolbar() {
+  const ob = $('#btnOnlineFirst');
+  if (ob) {
+    const sync = () => { ob.classList.toggle('primary', !!S.tbl.onlineFirst); ob.textContent = S.tbl.onlineFirst ? '置顶在线 ✓' : '置顶在线'; };
+    S._syncOnlineBtn = sync; sync();
+    ob.onclick = () => { S.tbl.onlineFirst = !S.tbl.onlineFirst; persistTbl(); sync(); renderMachineTable(); };
+  }
+  const cb = $('#btnCols'); if (cb) cb.onclick = () => openColPop(cb);
+  const eb = $('#btnCsv'); if (eb) eb.onclick = exportCsv;
+  const tb = $('#btnTsv'); if (tb) tb.onclick = copyTsv;
+  const vb = $('#btnViews'); if (vb) vb.onclick = () => openViewPop(vb);
+  const vsel = $('#viewSel'); if (vsel) renderViewSelect();
+  const q = $('#tblQ');
+  if (q) {
+    q.value = S.tbl.q || '';
+    let t = null;
+    q.oninput = () => { clearTimeout(t); t = setTimeout(() => { S.tbl.q = q.value; S.tbl.page = 1; persistTbl(); renderMachineTable(); }, 220); };
+  }
+  $$('.chip-btn').forEach((c) => {
+    c.classList.toggle('primary', (S.tbl.chip || 'all') === c.dataset.chip);
+    c.onclick = () => {
+      S.tbl.chip = c.dataset.chip;
+      S.tbl.page = 1;
+      $$('.chip-btn').forEach((x) => x.classList.toggle('primary', x === c));
+      persistTbl(); renderMachineTable();
+    };
+  });
+  const db = $('#btnDensity');
+  if (db) {
+    const sync = () => { db.textContent = (S.tbl.density === 'compact') ? '密度：紧凑' : '密度：舒适'; };
+    sync();
+    db.onclick = () => { S.tbl.density = (S.tbl.density === 'compact') ? 'cozy' : 'compact'; sync(); persistTbl(); applyDensity(); };
+  }
+  const bc = $('#btnBatchTest'); if (bc) bc.onclick = batchTest;
+  const bd = $('#btnBatchDel'); if (bd) bd.onclick = batchDelete;
+  const bs = $('#btnBatchSel'); if (bs) bs.onclick = () => { S.sel.clear(); renderMachineTable(); };
+  const ca = $('#btnClearAll'); if (ca) ca.onclick = clearAll;
+  applyDensity();
+})();
+function applyDensity() {
+  const t = $('#machineTable');
+  if (t) t.classList.toggle('compact', S.tbl.density === 'compact');
+}
+async function batchTest() {
+  const list = selectedMachines();
+  if (!list.length) return toast('先勾选机器');
+  toast('批量连接测试中…（' + list.length + ' 台）');
+  let on = 0, off = 0;
+  for (const m of list) {
+    const r = await api('/machines/' + m.id + '/test', 'POST', {}).catch(() => null);
+    if (r && r.online) on++; else off++;
+  }
+  await loadMachines();
+  toast(`批量测试完成：在线 ${on}，失败/离线 ${off}`);
+}
+async function batchDelete() {
+  const list = selectedMachines();
+  if (!list.length) return toast('先勾选机器');
+  if (!(await askConfirm(`确认从列表移除选中的 ${list.length} 台机器？仅移除记录，不影响目标机器。`))) return;
+  for (const m of list) await api('/machines/' + m.id, 'DELETE').catch(() => {});
+  S.sel.clear(); await loadMachines(); toast('已移除 ' + list.length + ' 台');
+}
+document.addEventListener('keydown', (e) => {
+  const view = $('#view-machines');
+  if (!view || !view.classList.contains('active')) return;
+  if (e.target && /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
+  const rows = viewData();
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!rows.length) return;
+    let i = rows.findIndex((m) => m.id === S.cursor);
+    i = e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i <= 0 ? 0 : i - 1);
+    S.cursor = rows[i >= 0 ? i : 0].id;
+    const size = Number(S.tbl.pageSize) > 0 ? Number(S.tbl.pageSize) : rows.length;
+    const wantPage = Math.floor((i >= 0 ? i : 0) / size) + 1;
+    if (wantPage !== S.tbl.page) S.tbl.page = wantPage;
+    renderMachineTable();
+  } else if (e.key === 'Enter' && S.cursor) {
+    machineAction('open', S.cursor);
+  } else if (e.key === ' ' && S.cursor) {
+    e.preventDefault();
+    if (S.sel.has(S.cursor)) S.sel.delete(S.cursor); else S.sel.add(S.cursor);
+    renderMachineTable();
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+    copyTsv();
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+    e.preventDefault();
+    if ($('#tblQ')) $('#tblQ').focus();
+  } else if (e.key === 'Escape') {
+    clearAll();
+  }
+});
+
+/* ================= 打印 / 导入导出（多格式；2026-09-24 v3） ================= */
+function exportRows() {
+  const scope = 'view';
+  const rows = scope === 'all' ? S.machines.slice() : viewData();
+  return rows;
+}
+function rowArrays(rows, allCols) {
+  const useCols = allCols ? COLS.slice() : COLS.filter((c) => S.tbl.hidden.indexOf(c.key) < 0);
+  const head = useCols.map((c) => c.label);
+  const body = rows.map((m) => useCols.map((c) => {
+    if (c.key === 'status') return STATUS_TEXT[m.status] || '未知';
+    if (c.key === 'lastCheck') return dispVal(m, 'lastCheck');
+    return dispVal(m, c.key);
+  }));
+  return { head, body };
+}
+function escXml(s) { return String(s === undefined || s === null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function toCsv(a) { return a.map((r) => r.map((x) => '"' + String(x === undefined || x === null ? '' : x).replace(/"/g, '""') + '"').join(',')).join('\r\n'); }
+function toTsv(a) { return a.map((r) => r.map((x) => String(x === undefined || x === null ? '' : x).replace(/[\t\r\n]/g, ' ')).join('\t')).join('\n'); }
+function toJson(rows, allCols) {
+  const useCols = allCols ? COLS.slice() : COLS.filter((c) => S.tbl.hidden.indexOf(c.key) < 0);
+  const arr = rows.map((m) => {
+    const o = {};
+    for (const c of useCols) o[c.key] = (c.key === 'status' ? (STATUS_TEXT[m.status] || '未知') : dispVal(m, c.key));
+    o.id = m.id;
+    o.online = m.status === 'online';
+    return o;
+  });
+  return JSON.stringify({ exportedAt: new Date().toISOString(), count: arr.length, machines: arr }, null, 2);
+}
+function toYaml(rows, allCols) {
+  const useCols = allCols ? COLS.slice() : COLS.filter((c) => S.tbl.hidden.indexOf(c.key) < 0);
+  const q = (v) => {
+    const s = String(v === undefined || v === null ? '' : v);
+    return /[:#\-\[\]{},"'\n]/.test(s) || s === '' ? '"' + s.replace(/"/g, '\\"') + '"' : s;
+  };
+  const lines = ['# 机器列表导出 ' + new Date().toLocaleString('zh-CN', { hour12: false }), 'machines:'];
+  for (const m of rows) {
+    lines.push('  - id: ' + q(m.id));
+    for (const c of useCols) lines.push('    ' + c.key + ': ' + q(c.key === 'status' ? (STATUS_TEXT[m.status] || '未知') : dispVal(m, c.key)));
+  }
+  return lines.join('\n');
+}
+function toXml(rows, allCols) {
+  const { head, body } = rowArrays(rows, allCols);
+  const keys = (allCols ? COLS.slice() : COLS.filter((c) => S.tbl.hidden.indexOf(c.key) < 0)).map((c) => c.key);
+  const out = ['<?xml version="1.0" encoding="UTF-8"?>', '<machines count="' + rows.length + '">'];
+  body.forEach((r, i) => {
+    out.push('  <machine id="' + escXml(rows[i].id) + '">');
+    r.forEach((v, j) => out.push('    <' + keys[j] + '>' + escXml(v) + '</' + keys[j] + '>'));
+    out.push('  </machine>');
+  });
+  out.push('</machines>');
+  return out.join('\n');
+}
+function toHtml(rows, allCols) {
+  const { head, body } = rowArrays(rows, allCols);
+  return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>机器列表</title>' +
+    '<style>body{font-family:"Microsoft YaHei",sans-serif;font-size:13px}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:4px 8px}th{background:#f0f0f0}</style></head><body>' +
+    '<h3>机器列表（' + rows.length + ' 台）　' + new Date().toLocaleString('zh-CN', { hour12: false }) + '</h3>' +
+    '<table><thead><tr>' + head.map((h) => '<th>' + escXml(h) + '</th>').join('') + '</tr></thead><tbody>' +
+    body.map((r) => '<tr>' + r.map((v) => '<td>' + escXml(v) + '</td>').join('') + '</tr>').join('') +
+    '</tbody></table></body></html>';
+}
+function toMd(rows, allCols) {
+  const { head, body } = rowArrays(rows, allCols);
+  return ['| ' + head.join(' | ') + ' |', '| ' + head.map(() => '---').join(' | ') + ' |']
+    .concat(body.map((r) => '| ' + r.map((v) => String(v).replace(/\|/g, '\\|')).join(' | ') + ' |')).join('\n');
+}
+function toTxt(rows, allCols) {
+  const { head, body } = rowArrays(rows, allCols);
+  const w = head.map((h, i) => Math.max(h.length * 2, ...body.map((r) => String(r[i] || '').length)));
+  const pad = (s, n) => String(s) + ' '.repeat(Math.max(0, n - String(s).length));
+  return [head.map((h, i) => pad(h, w[i])).join('  ')].concat(body.map((r) => r.map((v, i) => pad(v, w[i])).join('  '))).join('\n');
+}
+function fmtText(fmt, rows, allCols) {
+  const { head, body } = rowArrays(rows, allCols);
+  if (fmt === 'csv') return toCsv([head].concat(body));
+  if (fmt === 'tsv') return toTsv([head].concat(body));
+  if (fmt === 'json') return toJson(rows, allCols);
+  if (fmt === 'yaml') return toYaml(rows, allCols);
+  if (fmt === 'xml') return toXml(rows, allCols);
+  if (fmt === 'html') return toHtml(rows, allCols);
+  if (fmt === 'xls') return toHtml(rows, allCols);
+  if (fmt === 'md') return toMd(rows, allCols);
+  return toTxt(rows, allCols);
+}
+function download(name, text, mime) {
+  const blob = new Blob(['\ufeff' + text], { type: (mime || 'text/plain') + ';charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+function exportNow() {
+  const fmt = $('#dpFmt').value, scope = $('#dpScope').value, allCols = $('#dpCols').value === 'all';
+  let rows = scope === 'all' ? S.machines.slice() : (scope === 'sel' ? selectedMachines() : viewData());
+  if (!rows.length) return toast('没有可导出的行');
+  const text = fmtText(fmt, rows, allCols);
+  const ext = { csv: 'csv', tsv: 'tsv', json: 'json', yaml: 'yaml', xml: 'xml', html: 'html', xls: 'xls', md: 'md', txt: 'txt' }[fmt] || 'txt';
+  const mime = { csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json', yaml: 'text/yaml', xml: 'application/xml', html: 'text/html', xls: 'application/vnd.ms-excel', md: 'text/markdown', txt: 'text/plain' }[fmt];
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '');
+  download('机器列表_' + stamp + '.' + ext, text, mime);
+  toast('已导出 ' + rows.length + ' 台为 ' + fmt.toUpperCase());
+}
+function previewExport() {
+  const fmt = $('#dpFmt').value, scope = $('#dpScope').value, allCols = $('#dpCols').value === 'all';
+  const rows = scope === 'all' ? S.machines.slice() : (scope === 'sel' ? selectedMachines() : viewData());
+  const el = $('#dpPrev');
+  if (!el) return;
+  const text = fmtText(fmt, rows, allCols);
+  el.textContent = text.split('\n').slice(0, 8).join('\n') + (text.split('\n').length > 8 ? '\n…（共 ' + text.split('\n').length + ' 行）' : '');
+  const pv = $('#dpPreview');
+  if (pv) pv.textContent = rows.length + ' 台 · ' + text.length + ' 字符';
+}
+/* ---------- 导入解析（自动识别格式） ---------- */
+function normIp(s) { return String(s || '').trim(); }
+const IP_RE = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+function parseYamlLite(text) {
+  const recs = []; let cur = null;
+  const clean = (s) => String(s || '').replace(/^["']|["']$/g, '').trim();
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    const t = line.trim();
+    if (!t || t.charAt(0) === '#') continue;
+    const mItem = line.match(/^\s*-\s*(.*)$/);
+    if (mItem) {
+      if (cur) recs.push(cur);
+      cur = {};
+      const kv = mItem[1].match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
+      if (kv && cur) cur[kv[1].toLowerCase()] = clean(kv[2]);
+      continue;
+    }
+    if (cur && /^\s+\S/.test(line)) {
+      const kv = line.match(/^\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
+      if (kv) cur[kv[1].toLowerCase()] = clean(kv[2]);
+    }
+  }
+  if (cur) recs.push(cur);
+  return recs;
+}
+function parseImport(text) {
+  const out = [], bad = [];
+  const t = String(text || '').trim();
+  if (!t) return { items: out, bad: bad };
+  /* YAML（形如 - ip: 1.2.3.4 换行 name: xx） */
+  if (/(^|\n)\s*-\s/.test(t) && /(^|\s)ip\s*:/i.test(t)) {
+    for (const r of parseYamlLite(t)) {
+      const ip = normIp(r.ip || r.address || '');
+      if (!IP_RE.test(ip)) { bad.push(String(r.ip || JSON.stringify(r)).slice(0, 40)); continue; }
+      out.push({ ip: ip, name: r.name || r['名称'] || ip, port: Number(r.port || r['端口']) || 8090, rack: r.rack || r['机架'] || '', note: r.note || r['备注'] || '' });
+    }
+    return { items: out, bad: bad };
+  }
+  if (/^[\[{]/.test(t)) {
+    try {
+      const j = JSON.parse(t);
+      const arr = Array.isArray(j) ? j : (j.machines || []);
+      for (const r of arr) {
+        const ip = normIp(r.ip || r.IP || r.address);
+        if (!IP_RE.test(ip)) { bad.push(JSON.stringify(r).slice(0, 40)); continue; }
+        out.push({ ip: ip, name: r.name || r.名称 || ip, port: Number(r.port || r.端口) || 8090, rack: r.rack || r.机架 || '', note: r.note || r.备注 || '' });
+      }
+      return { items: out, bad: bad };
+    } catch (e) { /* 落到文本解析 */ }
+  }
+  const lines = t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let delim = null;
+  if (lines.some((l) => l.indexOf('\t') >= 0)) delim = '\t';
+  else if (lines.some((l) => l.indexOf(',') >= 0)) delim = ',';
+  else if (lines.some((l) => /[;；]/.test(l))) delim = ';';
+  let cellsOf = (l) => delim ? l.split(delim).map((x) => x.trim().replace(/^"|"$/g, '')) : l.split(/\s+/).map((x) => x.trim());
+  let header = null;
+  const first = cellsOf(lines[0] || '');
+  const looksHeader = first.some((c) => /^(ip|ip地址|地址|name|名称|port|端口|rack|机架|note|备注)$/i.test(c));
+  if (looksHeader) { header = first.map((c) => c.toLowerCase()); lines.shift(); }
+  const idx = (names, def) => { if (!header) return def; for (const n of names) { const i = header.findIndex((h) => h === n || h.indexOf(n) === 0); if (i >= 0) return i; } return def; };
+  const iIp = idx(['ip', 'ip地址', '地址'], header ? -1 : 0);
+  const iName = idx(['name', '名称', '主机'], 0);
+  const iPort = idx(['port', '端口'], -1);
+  const iRack = idx(['rack', '机架', '机房'], -1);
+  const iNote = idx(['note', '备注', '说明'], -1);
+  for (const l of lines) {
+    let cells = cellsOf(l);
+    if (delim === null) {
+      if (cells.length === 1) cells = l.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+    }
+    let ip = '', port = 8090;
+    for (const c of cells) {
+      const m = c.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?$/);
+      if (m) { ip = m[1]; if (m[2]) port = Number(m[2]); break; }
+    }
+    if (!ip && iIp >= 0) { const m = String(cells[iIp] || '').match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?$/); if (m) { ip = m[1]; if (m[2]) port = Number(m[2]); } }
+    if (!IP_RE.test(ip)) { bad.push(l.slice(0, 40)); continue; }
+    out.push({
+      ip: ip,
+      name: (iName >= 0 && cells[iName] && !IP_RE.test(cells[iName])) ? cells[iName] : ip,
+      port: iPort >= 0 && cells[iPort] ? (Number(cells[iPort]) || port) : port,
+      rack: iRack >= 0 ? (cells[iRack] || '') : '',
+      note: iNote >= 0 ? (cells[iNote] || '') : ''
+    });
+  }
+  return { items: out, bad: bad };
+}
+let _impDraft = null;
+function refreshImportPreview() {
+  const txt = $('#dpText') ? $('#dpText').value : '';
+  const r = parseImport(txt);
+  _impDraft = r;
+  const box = $('#dpInPrev');
+  if (box) {
+    const uniq = [], seen = new Set();
+    for (const it of r.items) { if (!seen.has(it.ip)) { seen.add(it.ip); uniq.push(it); } }
+    _impDraft.items = uniq;
+    box.innerHTML = `解析出 <b>${uniq.length}</b> 台` + (r.bad.length ? `，无法识别 <b style="color:var(--red)">${r.bad.length}</b> 行` : '') +
+      (uniq.length ? `<div class="muted small" style="margin-top:4px">${uniq.slice(0, 5).map((x) => esc(x.ip + (x.name !== x.ip ? '(' + x.name + ')' : ''))).join('、')}${uniq.length > 5 ? ' …' : ''}</div>` : '');
+  }
+}
+async function doImport() {
+  if (!_impDraft || !_impDraft.items.length) return toast('还没有可导入的数据');
+  if (!(await askConfirm(`确认导入 ${_impDraft.items.length} 台机器到列表？`))) return;
+  let ok = 0, skip = 0;
+  for (const it of _impDraft.items) {
+    const r = await api('/machines', 'POST', it).catch(() => null);
+    if (r && !r.error) ok++; else skip++;
+  }
+  $('#dataPop').classList.add('hide');
+  await loadMachines();
+  toast(`导入完成：新增 ${ok} 台` + (skip ? `，跳过 ${skip} 台（重复或格式问题）` : ''));
+}
+function openDataPop(anchor) {
+  const pop = $('#dataPop');
+  if (!pop) return;
+  pop.innerHTML = `<div class="sp-head">导入 / 导出 / 打印</div>
+    <div class="sp-tip muted small">导出多种格式；导入自动识别 CSV / TSV / JSON / YAML / Excel 复制的内容</div>
+    <div class="dp-tabs"><button class="btn small primary" data-tab="out">导出</button><button class="btn small" data-tab="in">导入</button><button class="btn small" data-tab="pr">打印</button></div>
+    <div id="dpOut">
+      <div class="sp-row"><span class="lb">格式</span><select id="dpFmt">
+        <option value="csv">CSV（Excel 通用）</option>
+        <option value="tsv">TSV（制表符）</option>
+        <option value="xls">Excel 表格（.xls）</option>
+        <option value="json">JSON</option>
+        <option value="yaml">YAML</option>
+        <option value="xml">XML</option>
+        <option value="html">HTML 网页</option>
+        <option value="md">Markdown</option>
+        <option value="txt">纯文本对齐表</option>
+      </select></div>
+      <div class="sp-row"><span class="lb">范围</span><select id="dpScope">
+        <option value="view">当前筛选/排序后的结果</option><option value="all">全部机器</option><option value="sel">仅选中的行</option>
+      </select></div>
+      <div class="sp-row"><span class="lb">列</span><select id="dpCols"><option value="vis">仅可见列</option><option value="all">全部列</option></select>
+        <span class="spacer"></span><span id="dpPreview" class="muted small"></span></div>
+      <div class="sp-foot"><button class="btn small primary" id="dpDl">下载文件</button><button class="btn small" id="dpCopy">复制到剪贴板</button></div>
+      <pre id="dpPrev" class="dp-prev"></pre>
+    </div>
+    <div id="dpIn" class="hide">
+      <textarea id="dpText" class="dp-text" rows="6" placeholder="粘贴内容，例如：&#10;192.168.2.201,机房A,机器A&#10;192.168.2.202&#10;或 CSV/TSV/JSON/YAML 带表头的数据"></textarea>
+      <div class="sp-row"><input type="file" id="dpFile" accept=".csv,.tsv,.txt,.json,.yaml,.yml,.xls,.html"><button class="btn small" id="dpParse">解析预览</button></div>
+      <div id="dpInPrev" class="muted small"></div>
+      <div class="sp-foot"><button class="btn small primary" id="dpImportNow">导入这些机器</button><span class="spacer"></span><button class="btn small" id="dpSample">填示例</button></div>
+    </div>
+    <div id="dpPr" class="hide">
+      <div class="sp-tip muted small">打印当前列表：只打印表格（含标题、时间、当前排序/筛选说明），不打印工具栏和按钮。</div>
+      <div class="sp-row"><label class="f"><input type="checkbox" id="dpPrColor" checked> 保留状态底色（离线淡红/未知淡黄）</label></div>
+      <div class="sp-foot"><button class="btn small primary" id="dpDoPrint">打印 / 打印预览</button></div>
+    </div>`;
+  pop.classList.remove('hide');
+  const r = (anchor || document.body).getBoundingClientRect();
+  let left = Math.min(r.left - 320, window.innerWidth - pop.offsetWidth - 8);
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight + 8 > window.innerHeight) top = Math.max(8, r.top - pop.offsetHeight - 6);
+  pop.style.left = Math.max(8, left) + 'px';
+  pop.style.top = top + 'px';
+  const setTab = (t) => {
+    $$('#dataPop .dp-tabs button').forEach((b) => b.classList.toggle('primary', b.dataset.tab === t));
+    $$('#dataPop #dpOut,#dataPop #dpIn,#dataPop #dpPr').forEach((d) => d.classList.add('hide'));
+    ($('#dp' + (t === 'out' ? 'Out' : t === 'in' ? 'In' : 'Pr')) || document.body).classList.remove('hide');
+    if (t === 'out') previewExport();
+  };
+  $$('#dataPop .dp-tabs button').forEach((b) => b.onclick = () => setTab(b.dataset.tab));
+  ['#dpFmt', '#dpScope', '#dpCols'].forEach((s) => { const el = $(s); if (el) el.onchange = previewExport; });
+  $('#dpDl').onclick = exportNow;
+  $('#dpCopy').onclick = () => { copyText(fmtText($('#dpFmt').value, $('#dpScope').value === 'all' ? S.machines : ($('#dpScope').value === 'sel' ? selectedMachines() : viewData()), $('#dpCols').value === 'all')); toast('已复制到剪贴板'); };
+  $('#dpText').oninput = () => { clearTimeout(_impDraft && _impDraft._t); refreshImportPreview(); };
+  $('#dpParse').onclick = refreshImportPreview;
+  $('#dpSample').onclick = () => { $('#dpText').value = 'name,ip,port,rack,note\n机房A机器1,192.168.2.201,8090,A-01,示例\n机房A机器2,192.168.2.202,8090,A-01,示例'; refreshImportPreview(); };
+  $('#dpFile').onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => { $('#dpText').value = String(fr.result || ''); refreshImportPreview(); };
+    fr.readAsText(f);
+  };
+  $('#dpImportNow').onclick = doImport;
+  $('#dpDoPrint').onclick = () => { pop.classList.add('hide'); printTable($('#dpPrColor') && $('#dpPrColor').checked); };
+  setTab('out');
+  document.addEventListener('click', function once(e) {
+    if (pop.classList.contains('hide')) { document.removeEventListener('click', once); return; }
+    if (pop.contains(e.target) || (e.target.closest && e.target.closest('#btnData'))) return;
+    pop.classList.add('hide');
+    document.removeEventListener('click', once);
+  });
+}
+/* ---------- 打印 ---------- */
+function printTable(keepColor) {
+  const rows = viewData();
+  const cols = visibleCols().filter((c) => c.key !== '__sel');
+  const headHtml = cols.map((c) => `<th>${esc(c.label)}</th>`).join('');
+  const body = rows.map((m) => `<tr class="${rowClass(m)}">` + cols.map((c) => `<td>${cellHtml(m, c.key)}</td>`).join('') + '</tr>').join('');
+  let box = $('#printTableBox');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'printTableBox';
+    box.className = 'print-only';
+    const panel = $('#view-machines .panel');
+    const anchor = $('#printHead');
+    if (panel) panel.insertBefore(box, anchor ? anchor.nextSibling : panel.firstChild);
+    else document.body.appendChild(box);
+  }
+  box.innerHTML = `<table class="tbl"><thead><tr>${headHtml}</tr></thead><tbody>${body}</tbody></table>`;
+  const infoEl = $('#printHead');
+  if (infoEl) {
+    const fk = Object.keys(S.tbl.filters || {}).filter((k) => (S.tbl.filters[k] || []).length);
+    const bits = [];
+    if (S.tbl.sort.length) bits.push('排序：' + sortDesc());
+    if (fk.length) bits.push('筛选：' + fk.map((k) => (colByKey(k) ? colByKey(k).label : k)).join('、'));
+    if (S.tbl.q) bits.push('搜索：“' + S.tbl.q + '”');
+    if (S.tbl.chip && S.tbl.chip !== 'all') bits.push('快速筛选：' + S.tbl.chip);
+    infoEl.innerHTML = `<div class="ph-title">机器列表　（${rows.length} 台）</div>
+      <div class="ph-sub">${new Date().toLocaleString('zh-CN', { hour12: false })}${bits.length ? '　' + esc(bits.join('　|　')) : ''}</div>`;
+  }
+  document.body.classList.toggle('print-nocolor', !keepColor);
+  setTimeout(() => {
+    window.print();
+    setTimeout(() => document.body.classList.remove('print-nocolor'), 800);
+  }, 60);
+}
+(function bindDataToolbar() {
+  const b = $('#btnData'); if (b) b.onclick = () => openDataPop(b);
+  const p = $('#btnPrint'); if (p) p.onclick = () => printTable(true);
+})();
 
 /* ---------------- 登录 / 权限 ---------------- */
 function showLogin() {
@@ -160,6 +1375,7 @@ $$('.tab').forEach((b) => b.onclick = () => {
 
 /* ---------------- 机器 ---------------- */
 async function loadMachines() {
+  if (!S._tblPrefsLoaded) { S._tblPrefsLoaded = true; try { await loadTblPrefs(); } catch (e) {} }
   const r = await api('/machines');
   S.machines = r.machines || [];
   const sel = $('#machineSelect');
@@ -176,20 +1392,13 @@ async function loadMachines() {
       if (S.activeTab) activateTab(S.activeTab);
     };
   }
-  $('#machineRows').innerHTML = S.machines.map((m) => `<tr>
-    <td>${esc(m.name)}${m.local ? ' <span class="chip sys">本机</span>' : ''}</td>
-    <td style="font-family:var(--mono)">${esc(m.ip)}</td><td>${m.port}</td>
-    <td><span class="dot ${m.status === 'online' ? 'on' : m.status === 'offline' ? 'off' : ''}"></span> ${m.status === 'online' ? '在线' : m.status === 'offline' ? '离线' : '未知'}</td>
-    <td class="muted small">${m.lastCheck ? new Date(m.lastCheck).toLocaleString('zh-CN', { hour12: false }) : '-'}</td>
-    <td class="muted small">${esc(m.note || '')}</td>
-    <td>
-      <button class="btn small" data-act="test" data-id="${m.id}">连接测试</button>
-      <button class="btn small" data-act="open" data-id="${m.id}">打开页面</button>
-      <button class="btn small" data-act="edit" data-id="${m.id}">编辑</button>
-      ${m.local ? '' : `<button class="btn small" data-act="del" data-id="${m.id}">删除</button>`}
-    </td></tr>`).join('');
-  $$('#machineRows .btn').forEach((b) => b.onclick = () => machineAction(b.dataset.act, b.dataset.id));
-  updateSvc();
+  renderMachineTable();
+  loadMachineIps();
+}
+/* 每台机器的 IP 列表：后端并行探测（不阻塞列表），拿到后补渲染 */
+async function loadMachineIps() {
+  const r = await api('/machines/ips');
+  if (r && r.ips) { S.machineIps = r.ips; renderMachineTable(); }
 }
 function curMachine() { return S.machines.find((m) => m.id === S.machineId) || S.machines[0]; }
 function updateSvc() {
@@ -213,13 +1422,18 @@ async function machineAction(act, id) {
     if (r.url) window.open(r.url, '_blank');
     else toast(r.error || '无法打开');
   } else if (act === 'edit') {
-    const name = await askPrompt('名称', m.name); if (name === null) return;
-    const ip = await askPrompt('IP', m.ip); if (ip === null) return;
-    const port = await askPrompt('端口', m.port); if (port === null) return;
-    const note = await askPrompt('备注', m.note || ''); if (note === null) return;
-    const r = await api(`/machines/${id}`, 'PATCH', { name, ip, port: Number(port), note });
+    /* 2026-09-24：改为一次性小表单（原来要依次回答 4 个 prompt，且没有机房/机架） */
+    const v = await askForm('编辑机器 · ' + (m.name || m.ip), [
+      { key: 'name', label: '名称', value: m.name || '', placeholder: '机器显示名称' },
+      { key: 'ip', label: 'IP', value: m.ip || '', placeholder: '如 192.168.2.130' },
+      { key: 'port', label: '端口', value: m.port || 8090 },
+      { key: 'rack', label: '机房/机架', value: m.rack || '', placeholder: '如 A-01（可选）' },
+      { key: 'note', label: '备注', value: m.note || '', placeholder: '备注（可选）' }
+    ]);
+    if (v === null) return;
+    const r = await api(`/machines/${id}`, 'PATCH', { name: v.name.trim(), ip: v.ip.trim(), port: Number(v.port), rack: v.rack, note: v.note });
     if (r.error) return toast('❌ ' + r.error, 5000);
-    loadMachines();
+    toast('✔ 已保存'); loadMachines();
   } else if (act === 'del') {
     if (!(await askConfirm(`确认从列表移除 ${m.name}（${m.ip}）？仅移除记录，不影响目标机器。`))) return;
     await api(`/machines/${id}`, 'DELETE');
@@ -1452,8 +2666,10 @@ async function boot() {
   fillLoginHost(h);
   toast(`服务已连接：${h.hostname} · ${h.ips.map((i) => i.ip).join(' / ')}:${h.port}`, 4000);
   updateDryBadge(h.dryRun);
+  if (!TOKEN) { showLogin(); return; }   /* 没 token：直接到登录页，不再发任何需鉴权的请求（401 噪音清零） */
   const ok = await loadMe();
-  if (!ok) { showLogin(); } else { hideLogin(); }
+  if (!ok) { TOKEN = ''; try { localStorage.removeItem(TOKEN_KEY); } catch (e) {} showLogin(); return; }
+  hideLogin();
   await loadMachines();
   await loadDisks(true);
   newTab('终端 1');
