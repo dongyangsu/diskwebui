@@ -1371,7 +1371,20 @@ $$('.tab').forEach((b) => b.onclick = () => {
   if (b.dataset.view === 'logs') loadLogs();
   if (b.dataset.view === 'settings') { loadSettings(); loadHistory(); }
   if (b.dataset.view === 'machines') loadMachines();
+  /* 底部命令行只在「硬盘」页挂出；两个终端各自独立，不需要搬来搬去 */
+  document.body.classList.toggle('dock-show', b.dataset.view === 'dash');
+  syncDockSpace();
+  ensureTerms();
+  setTimeout(() => {
+    syncDockSpace();
+    fitAll();
+    hugAll(true);
+    if (b.dataset.view === 'terminal' && MAIN.term) MAIN.term.focus();
+  }, 60);
 });
+/* 窗口尺寸变化 → 两个终端各自自适应（改的是各自服务端 pty 的真实窗口） */
+let fitTimer = null;
+window.addEventListener('resize', () => { if (fitTimer) clearTimeout(fitTimer); fitTimer = setTimeout(() => { syncDockSpace(); hugAll(true); fitAll(); }, 140); });
 
 /* ---------------- 机器 ---------------- */
 async function loadMachines() {
@@ -1389,7 +1402,8 @@ async function loadMachines() {
     tm.onchange = () => {
       S.termMachine = tm.value;
       toast('命令行目标机器：' + (S.machines.find((m) => m.id === S.termMachine) || {}).name);
-      if (S.activeTab) activateTab(S.activeTab);
+      if (S.activeTab) activateTab(MAIN, S.activeTab);
+      if (S.dockActiveTab) activateTab(DOCK, S.dockActiveTab);
     };
   }
   renderMachineTable();
@@ -1602,6 +1616,10 @@ function renderDiskList() {
           ${def}
           ${snapChip}
           ${d.isSystemDisk ? '<span class="chip sys">系统盘</span>' : ''}
+          ${d.isUnknownDisk ? '<span class="chip bad">未知盘</span>' : ''}
+          ${d.brandUnrecognized ? '<span class="chip bad">品牌未识别</span>' : ''}
+          ${d.brandFromOem ? '<span class="chip">品牌来源：' + esc(d.brandFromOem) + '</span>' : ''}
+          ${d.brandPending ? '<span class="chip warn">品牌待确认</span>' : ''}
           ${d.isMounted ? '<span class="chip bad">已挂载</span>' : ''}
           ${d.hasOverride ? '<span class="chip warn">人工修正</span>' : ''}
           ${d.allowFormat ? '' : '<span class="chip bad">禁止格式化</span>'}
@@ -1621,7 +1639,7 @@ function updateSelCount() {
   const n = S.checked.size;
   $('#selCount').textContent = `已选 ${n}`;
   const sel = S.disks.filter((d) => S.checked.has(d.id));
-  const blocked = sel.filter((d) => !d.allowFormat && d.defectStatus !== '未知').length;
+  const blocked = sel.filter((d) => !d.allowFormat).length;
   $('#btnBatchFormat').textContent = n ? `批量格式化 (${n})` : '批量格式化';
 }
 $('#chkAll').onchange = (e) => {
@@ -1699,7 +1717,6 @@ function renderDetail(d) {
   S.cfg = S.cfg[d.id] || { toolId: d.recommendedTool || '', mode: '', lunSize: d.lunSizeOverride || 512, customCommand: '' };
   const brandOpts = ['日立/HGST', '西数', '希捷', '东芝', '其他'].map((b) => `<option ${d.brand === b ? 'selected' : ''}>${b}</option>`).join('');
   const itOpts = ['SAS', 'SATA', 'NVMe', '其他'].map((b) => `<option ${d.interfaceType === b ? 'selected' : ''}>${b}</option>`).join('');
-  const stOpts = ['有', '无', '未知'].map((b) => `<option ${d.defectStatus === b ? 'selected' : ''}>${b}</option>`).join('');
   $('#detail').className = 'detail';
   $('#detail').innerHTML = `
     <h2>${esc(d.device)} <span class="muted small">${esc(d.sizeText)}</span></h2>
@@ -1707,7 +1724,7 @@ function renderDetail(d) {
 
     <div class="sect">
       <div class="kv">
-        <div class="k">自动识别品牌</div><div class="v">${esc(d.autoBrand)}</div>
+        <div class="k">自动识别品牌</div><div class="v">${esc(d.autoBrand)}${d.brandFromOem ? ' <span class="tag">来源：' + esc(d.brandFromOem) + '</span>' : ''}</div>
         <div class="k">当前采用品牌</div><div class="v"><select id="eBrand">${brandOpts}</select></div>
         <div class="k">自动识别接口</div><div class="v">${esc(d.autoInterface)} <span class="muted small">(TRAN=${esc(d.tran || '-')})</span></div>
         <div class="k">当前采用接口</div><div class="v"><select id="eIt">${itOpts}</select></div>
@@ -1730,10 +1747,11 @@ function renderDetail(d) {
     </div>
 
     <div class="sect">
-      <h3>缺陷判断（${esc(d.defectMethod)}）：<b style="color:${d.defectStatus === '有' ? '#b45309' : d.defectStatus === '无' ? '#16a34a' : '#dc2626'}">${esc(d.defectStatus)}</b>
+      <h3>缺陷判定（${esc(d.defectMethod)}）：<b style="color:${d.defectStatus === '有' ? '#b45309' : d.defectStatus === '无' ? '#16a34a' : '#dc2626'}">${esc(d.defectStatus)}</b>
         ${d.defectSnapshot === 'before' ? '<span class="muted small">（该盘正在格式化，SMART 暂时读不到 → 显示格式化前的快照值）</span>' : ''}</h3>
       <div class="row">
-        <button class="btn" id="btnDefect">⚠ 缺陷判断…</button>
+        <button class="btn" id="btnDefect">⚠ 缺陷判定 / 格式化许可…</button>
+        <span class="chip">人工修正：${d.allowOverride ? esc(d.allowOverride) + '格式化' : '不干预'}</span>
         <b>${d.allowFormat ? '✔ 允许继续格式化' : '⛔ 禁止格式化'}</b>
         ${d.allowFormat ? '' : `<span class="muted small">${esc(d.blockReason)}</span>`}
       </div>
@@ -1761,23 +1779,25 @@ function renderDetail(d) {
 }
 
 
-/* ---------- 缺陷判断弹窗（关闭 / 取消 / 保存人工修正）---------- */
+/* ---------- 缺陷判定 / 格式化许可弹窗（关闭 / 取消 / 保存人工修正）---------- */
 function openDefectConfig(d) {
   const div = document.createElement('div');
   div.className = 'modal'; div.id = 'defectModal';
-  const stOpts = ['有', '无', '未知'].map((x) => `<option ${d.defectStatus === x ? 'selected' : ''}>${x}</option>`).join('');
+  /* 2026-09-29：人工修正不再改判定值，只改「能否格式化」→ 三态：不干预/允许/禁止 */
+  const aoOpts = [['', '不干预（按自动判定）'], ['允许', '允许格式化'], ['禁止', '禁止格式化']]
+    .map(([v, t]) => `<option value="${v}" ${(d.allowOverride || '') === v ? 'selected' : ''}>${t}</option>`).join('');
   const vals = Object.entries(d.defectValues || {}).map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${(v === null || v === undefined) ? '<span class="muted">读取失败</span>' : esc(v)}</div>`).join('');
   div.innerHTML = `<div class="dialog" style="width:640px">
-    <div class="row"><h2 style="margin:0">⚠ 缺陷判断 · ${esc(d.device)}</h2><div class="spacer"></div><button class="btn" id="dfX">✕ 关闭</button></div>
-    <div class="muted small">判断方式：<b>${esc(d.defectMethod)}</b> ｜ ${esc(d.brand)} · ${esc(d.interfaceType)} · SN ${esc(d.serial || '-')}</div>
+    <div class="row"><h2 style="margin:0">⚠ 缺陷判定 / 格式化许可 · ${esc(d.device)}</h2><div class="spacer"></div><button class="btn" id="dfX">✕ 关闭</button></div>
+    <div class="muted small">判定方式：<b>${esc(d.defectMethod)}</b> ｜ ${esc(d.brand)} · ${esc(d.interfaceType)} · SN ${esc(d.serial || '-')}</div>
     <div class="kv">
-      <div class="k">自动识别缺陷状态</div><div class="v">${esc(d.autoDefectStatus)}</div>
-      <div class="k">当前采用缺陷状态</div><div class="v"><select id="eDef">${stOpts}</select> <span class="muted small">人工修正优先于自动识别</span></div>
+      <div class="k">自动判定缺陷状态</div><div class="v"><b>${esc(d.autoDefectStatus)}</b> <span class="muted small">（只读，判定只看扫描值）</span></div>
+      <div class="k">格式化许可（人工）</div><div class="v"><select id="eDef">${aoOpts}</select> <span class="muted small">只影响能否格式化，不改判定值</span></div>
       ${vals}
     </div>
     ${d.defectReason ? `<div class="warnbox">${esc(d.defectReason)}</div>` : ''}
     <div class="row"><span class="muted small">当前结论：</span><b>${d.allowFormat ? '✔ 允许继续格式化' : '⛔ 禁止格式化'}</b>${d.allowFormat ? '' : `<span class="muted small">${esc(d.blockReason)}</span>`}</div>
-    <div class="muted small">保存后按序列号持久化，下次插入同一块盘优先采用人工修正结果。</div>
+    <div class="muted small">规则：有缺陷/未知 → 默认放行；无缺陷 → 禁止；人工修正可覆盖放行结果（按序列号持久化）。</div>
     <div class="row right"><button class="btn" id="dfCancel">取消</button><button class="btn primary" id="dfSave">保存人工修正</button></div>
   </div>`;
   document.body.appendChild(div);
@@ -1785,9 +1805,9 @@ function openDefectConfig(d) {
   div.querySelector('#dfX').onclick = close;
   div.querySelector('#dfCancel').onclick = close;
   div.querySelector('#dfSave').onclick = async () => {
-    const r = await api(`/machines/${S.machineId}/disks/${encodeURIComponent(d.id)}/override`, 'PATCH', { defectStatus: div.querySelector('#eDef').value });
+    const r = await api(`/machines/${S.machineId}/disks/${encodeURIComponent(d.id)}/override`, 'PATCH', { allowFormat: div.querySelector('#eDef').value });
     if (r.error) return toast('❌ ' + r.error);
-    S.sel = r; close(); toast('缺陷判断人工修正已保存（按序列号持久化）'); loadDisks(false);
+    S.sel = r; close(); toast('格式化许可人工修正已保存（按序列号持久化）'); loadDisks(false);
   };
 }
 
@@ -1795,7 +1815,7 @@ function openDefectConfig(d) {
 function cfgSummaryText(d) {
   const c = S.cfg || {};
   const toolId = c.toolId || '';
-  const toolName = toolId ? toolId : ('自动推荐（' + (d.recommendedTool || '无') + '）');
+  const toolName = toolId ? toolId : (d.recommendedTool ? ('自动推荐（' + d.recommendedTool + '）') : (d.brandUnrecognized ? '⚠ 品牌未识别 → 请人工选择工具' : '自动推荐（无）'));
   return { tool: toolName, mode: c.mode || '默认', size: (Number(c.lunSize) || 512) + ' B' };
 }
 function renderCfgSummary(d) {
@@ -1925,12 +1945,12 @@ function openConfirm(d) {
     const rd = res.rendered || {};
     $('#confirmTable').innerHTML = [
       ['设备名', d.device], ['序列号', d.serial], ['容量', d.sizeText], ['品牌', d.brand], ['接口', d.interfaceType],
-      ['格式化逻辑块大小', rd.lunSize + 'B'], ['工具', rd.toolName], ['模式', rd.mode], ['缺陷状态', d.defectStatus],
+      ['格式化逻辑块大小', rd.lunSize + 'B'], ['工具', rd.toolName], ['模式', rd.mode], ['缺陷判定', d.defectStatus], ['格式化许可', d.allowOverride || '不干预'],
     ].map(([k, v]) => `<tr><td class="muted">${k}</td><td style="font-family:var(--mono)">${esc(v)}</td></tr>`).join('');
     $('#confirmCmd').textContent = rd.command || '';
     $('#confirmCwd').textContent = rd.cwd ? '工作目录：' + rd.cwd : '';
     $('#confirmWarn').className = 'warnbox' + (d.defectStatus === '未知' ? '' : ' hide');
-    $('#confirmWarn').textContent = d.defectStatus === '未知' ? '⚠️ 该硬盘缺陷状态为「未知」，属于默认禁止场景，需人工确认覆盖。' : '';
+    $('#confirmWarn').textContent = d.defectStatus === '未知' ? '⚠️ 该硬盘缺陷值未知（读不到），按规则默认放行；格式化后请确认重扫结果。' : '';
     $('#confirmChk').checked = false; $('#confirmGo').disabled = true;
     $('#confirmModal').classList.remove('hide');
   });
@@ -2071,111 +2091,285 @@ function renderDiskProgress() {
   if (b2 && st.jobId) b2.onclick = () => window.open('/api/v1/machines/' + (S.machineId || 'local') + '/jobs/' + st.jobId + '/log?token=' + encodeURIComponent(TOKEN), '_blank');
 }
 
-/* ---------------- 命令行（多开/多标签） ---------------- */
-function newTab(name) {
-  const id = 'c_' + Math.random().toString(36).slice(2, 8);
-  const t = { id, name: name || '终端 ' + (S.tabs.length + 1), buf: [] };
-  S.tabs.push(t); activateTab(t.id);
-  return t;
+/* ---------------- 命令行（真终端：xterm.js ↔ 服务端 PTY） ----------------
+   2026-09-28 二次重构：
+   - 「命令行」页 与 底部抽屉 = **两个独立终端**（各自 tabs / 会话 / 尺寸，互不联动）。
+   - 关闭标签：关掉最后一个 → 该终端清屏（抽屉同时收起）；还有别的标签 → 自动切到另一个。
+   - 抽屉：点「＋ 创建终端」自动展开；关闭最后一个终端自动收起。
+   - 真终端 = 原样执行通道；危险命令由服务端 bash rc 预拦截（设置页可关）。 */
+const XT_OPTS = {
+  cursorBlink: true,
+  convertEol: false,
+  scrollback: 5000,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace',
+  fontSize: 13,
+  theme: { background: '#0b1220', foreground: '#cbd5e1', cursor: '#7dd3fc', selectionBackground: '#334155' },
+};
+const TERM_SZ_KEY = 'dw_term_size';
+let termSize = null;
+try { termSize = JSON.parse(localStorage.getItem(TERM_SZ_KEY) || 'null'); } catch (e) { termSize = null; }
+
+/* 每个终端一个控制器：term/fit/es/size 全部独立 */
+function mkCtl(key, hostSel, barSel, isDock) {
+  return { key: key, hostSel: hostSel, barSel: barSel, isDock: !!isDock, term: null, fit: null, es: null, inBuf: '', inTimer: null, size: null, hugTimer: null, hugging: false, hugRows: null, maxRows: 0, cellH: 0 };
 }
-function activateTab(id) {
-  S.activeTab = id;
-  renderTabBars();
-  const t = S.tabs.find((x) => x.id === id); if (!t) return;
-  if (S.termES) S.termES.close();
-  const tmid = S.termMachine || 'local';
-  const url = tmid === 'local' ? `/api/v1/terminal/${id}/stream?token=${encodeURIComponent(TOKEN)}` : `/api/v1/machines/${tmid}/terminal/${id}/stream?token=${encodeURIComponent(TOKEN)}`;
-  const es = new EventSource(url);
-  S.termES = es;
-  es.onmessage = (ev) => {
-    const o = JSON.parse(ev.data);
-    t.buf.push(stripAnsi(o.line));
-    if (t.buf.length > 1000) t.buf.splice(0, t.buf.length - 1000);
-    if (S.activeTab === id) paintTerm();
-  };
-  paintTerm();
-  $('#termCwd').value = t.cwd || '';
-}
-function paintTerm() {
-  const t = S.tabs.find((x) => x.id === S.activeTab); if (!t) return;
-  const txt = t.buf.join('');
-  for (const sel of ['#termOut', '#dockOut']) { const el = $(sel); if (el) el.textContent = txt; el.scrollTop = el.scrollHeight; }
-  if (t.cwd) $('#termCwd').value = t.cwd;
-}
-function renderTabBars() {
-  const html = S.tabs.map((t) => `<span class="ttab ${t.id === S.activeTab ? 'active' : ''}" data-id="${t.id}">${esc(t.name)} ✕</span>`).join('');
-  $('#termTabBar').innerHTML = html;
-  $('#dockTabs').innerHTML = html;
-  $$('.ttab').forEach((el) => el.onclick = (e) => {
-    const id = el.dataset.id;
-    if (/✕/.test(e.target.textContent) && e.offsetX > el.offsetWidth - 18) { closeTab(id); return; }
-    activateTab(id);
+const MAIN = mkCtl('main', '#termHost', '#termTabBar', false);
+const DOCK = mkCtl('dock', '#dockTerm', '#dockTabs', true);
+const CTLS = { main: MAIN, dock: DOCK };
+function tabsOf(c) { return c.isDock ? (S.dockTabs = S.dockTabs || []) : (S.tabs = S.tabs || []); }
+function setTabs(c, arr) { if (c.isDock) S.dockTabs = arr; else S.tabs = arr; }
+function activeOf(c) { return c.isDock ? S.dockActiveTab : S.activeTab; }
+function setActive(c, id) { if (c.isDock) S.dockActiveTab = id; else S.activeTab = id; }
+
+function ensureTerm(c) {
+  if (c.term) return c.term;
+  const host = $(c.hostSel);
+  if (!host || !window.Terminal) return null;
+  c.term = new window.Terminal(XT_OPTS);
+  try {
+    if (window.FitAddon && window.FitAddon.FitAddon) { c.fit = new window.FitAddon.FitAddon(); c.term.loadAddon(c.fit); }
+    if (window.WebLinksAddon && window.WebLinksAddon.WebLinksAddon) c.term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+  } catch (e) {}
+  c.term.open(host);
+  c.term.onData((d) => termSendRaw(c, d));
+  c.term.onResize((sz) => {
+    c.size = { cols: sz.cols, rows: sz.rows };
+    try { localStorage.setItem(TERM_SZ_KEY, JSON.stringify(c.size)); } catch (e) {}
+    postTerm(c, 'resize', { cols: sz.cols, rows: sz.rows });
   });
+  fitTerm(c);
+  return c.term;
 }
-function closeTab(id) {
-  S.tabs = S.tabs.filter((t) => t.id !== id);
-  if (S.activeTab === id) { S.activeTab = S.tabs[0] ? S.tabs[0].id : null; if (S.activeTab) activateTab(S.activeTab); }
-  renderTabBars();
+function ensureTerms() { ensureTerm(MAIN); ensureTerm(DOCK); }
+function fitTerm(c) {
+  if (!c.term || !c.fit) return;
+  const el = c.term.element;
+  if (!el || !el.offsetParent) return;   /* 不可见时量不准，先跳过 */
+  try { c.fit.fit(); } catch (e) {}
 }
-async function runCmd(cmd, inputEl) {
-  if (!cmd.trim()) return;
-  let t = S.tabs.find((x) => x.id === S.activeTab) || newTab();
-  const cwd = $('#termCwd').value.trim();
-  inputEl.value = '';
-  const tmid = S.termMachine || 'local';
-  const path = tmid === 'local' ? '/terminal/exec' : `/machines/${tmid}/terminal/exec`;
-  const r = await api(path, 'POST', { sessionId: t.id, cmd, cwd: cwd || undefined });
-  if (!t.hist) t.hist = [];
-  if (t.hist[0] !== cmd) { t.hist.unshift(cmd); t.hist = t.hist.slice(0, 200); }
-  inputEl._histIdx = undefined;
-  if (r.error) toast(r.error);
-  else if (r.blocked) toast('命令被拦截：' + r.blocked, 5000);
-  else if (r.needConfirm) {
-    if (await askConfirm('⚠ 该命令会改动/擦除硬盘数据，确认执行？\n\n' + cmd)) {
-      const r2 = await api(path, 'POST', { sessionId: t.id, cmd, cwd: cwd || undefined, confirm: true });
-      if (r2.error) toast(r2.error);
-      else if (r2.blocked) toast('命令被拦截：' + r2.blocked, 5000);
-    } else toast('已取消执行（未确认）');
+/* ---------- 终端高度跟着内容走（不然内容只有几行也占满一屏，底下大片空白）---------
+   - 最少 HUG_MIN_ROWS 行，最多不超过当前可用空间（maxRows）
+   - vim/top 这类全屏程序（alternate buffer）自动恢复撑满
+   - 输出突发时只做防抖重算，不会疯狂抖动 */
+const HUG_MIN_ROWS = 8;
+function termCellH(host, term) {
+  /* 用 .xterm-screen 的实际高度算单元格高度：与当前行数无关，任何时候都准 */
+  const scr = host.querySelector('.xterm-screen');
+  if (scr && term.rows > 0) {
+    const h = scr.getBoundingClientRect().height;
+    if (h > 0) return h / term.rows;
+  }
+  const h2 = host.clientHeight - 12;
+  return (term.rows > 0 && h2 > 0) ? (h2 / term.rows) : 0;
+}
+function hugTerm(c, force) {
+  if (!c.term || !c.fit) return;
+  const host = $(c.hostSel);
+  if (!host || !host.offsetParent) return;
+  const b = c.term.buffer.active;
+  if (b.type === 'alternate') {
+    if (c.hugging) { host.style.height = ''; host.style.flex = '1 1 auto'; c.hugging = false; c.hugRows = null; fitTerm(c); }
+    return;
+  }
+  if (force || !c.maxRows) {
+    const keep = host.style.height;
+    host.style.height = ''; host.style.flex = '1 1 auto';
+    try { c.fit.fit(); } catch (e) {}
+    c.maxRows = Math.max(HUG_MIN_ROWS, c.term.rows);
+    c.cellH = termCellH(host, c.term) || c.cellH;
+    host.style.height = keep;
+  }
+  if (!c.cellH) c.cellH = termCellH(host, c.term);
+  if (!c.cellH) return;
+  let last = -1;
+  for (let i = b.length - 1; i >= 0; i--) {
+    if (b.getLine(i).translateToString(true).trim()) { last = i; break; }
+  }
+  const want = Math.max(HUG_MIN_ROWS, Math.min(last + 2, c.maxRows));
+  if (c.hugging && c.hugRows === want) return;
+  c.hugRows = want;
+  c.hugging = true;
+  host.style.flex = '0 0 auto';
+  host.style.height = Math.ceil(want * c.cellH + 13) + 'px';
+  try { c.fit.fit(); } catch (e) {}
+  /* 自校正：刚展开（动画中）/刚显示时量不准，会出现行数对不上——重试一次 */
+  if (c.term.rows !== want && c.retryFor !== want) {
+    c.retryFor = want;
+    setTimeout(() => { if (c.hugRows === want) { c.cellH = termCellH(host, c.term) || c.cellH; c.maxRows = 0; hugTerm(c, true); } }, 260);
   }
 }
-$('#btnNewTab').onclick = () => newTab();
-$('#btnRun').onclick = () => runCmd($('#termInput').value, $('#termInput'));
-$('#termInput').onkeydown = (e) => {
-  if (histKey(e, $('#termInput'))) return;
-  if (e.key === 'Enter') runCmd(e.target.value, e.target);
-};
-$('#dockInput').onkeydown = (e) => {
-  if (histKey(e, $('#dockInput'))) return;
-  if (e.key === 'Enter') runCmd(e.target.value, e.target);
-};
-/* 命令历史：↑/↓ 调用（第 5.1 章） */
-function histKey(e, input) {
-  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return false;
-  const t = S.tabs.find((x) => x.id === S.activeTab);
-  const h = (t && t.hist) || [];
-  if (!h.length) return false;
-  const idxKey = '_histIdx';
-  if (e.key === 'ArrowUp') input[idxKey] = Math.min(h.length - 1, (input[idxKey] === undefined ? -1 : input[idxKey]) + 1);
-  else input[idxKey] = Math.max(-1, (input[idxKey] === undefined ? h.length : input[idxKey]) - 1);
-  input.value = input[idxKey] === -1 ? '' : h[input[idxKey]];
-  e.preventDefault();
-  return true;
+function scheduleHug(c, ms) {
+  if (c.hugTimer) clearTimeout(c.hugTimer);
+  c.hugTimer = setTimeout(() => { c.hugTimer = null; hugTerm(c); }, ms == null ? 220 : ms);
 }
-$('#btnTermStop').onclick = async () => { const t = S.tabs.find((x) => x.id === S.activeTab); if (t) { const tmid1 = S.termMachine || 'local'; await api(tmid1 === 'local' ? `/terminal/${t.id}/stop` : `/machines/${tmid1}/terminal/${t.id}/stop`, 'POST', {}); toast('已发送中断'); } };
-$('#btnSetCwd').onclick = async () => {
-  const t = S.tabs.find((x) => x.id === S.activeTab) || newTab();
-  const tmid2 = S.termMachine || 'local';
-  const r = await api(tmid2 === 'local' ? `/terminal/${t.id}/cwd` : `/machines/${tmid2}/terminal/${t.id}/cwd`, 'POST', { cwd: $('#termCwd').value.trim() });
-  t.cwd = r.cwd; toast('工作目录：' + r.cwd);
+function hugAll(force) { hugTerm(MAIN, force); }   /* 只对「命令行」页的终端做贴内容，抽屉不动 */
+function fitAll() { fitTerm(MAIN); fitTerm(DOCK); }
+function termPathFor(c, id, tail) {
+  /* 相对路径：项目里的 api() 会自动补 /api/v1（写全会变成 /api/v1/api/v1/... → 404）*/
+  const tmid = S.termMachine || 'local';
+  return tmid === 'local' ? `/terminal/${id}/${tail}` : `/machines/${tmid}/terminal/${id}/${tail}`;
+}
+function termPath(c, tail) { return termPathFor(c, activeOf(c), tail); }
+async function postTerm(c, tail, body) {
+  if (!activeOf(c)) return null;
+  try { return await api(termPath(c, tail), 'POST', body || {}); } catch (e) { return null; }
+}
+/* 按键流：12ms 合批（少请求，也避免并发乱序） */
+function termSendRaw(c, d) {
+  if (!d) return;
+  c.inBuf += d;
+  if (c.inTimer) return;
+  c.inTimer = setTimeout(() => {
+    c.inTimer = null;
+    const data = c.inBuf; c.inBuf = '';
+    if (data) postTerm(c, 'input', { data }).then((r) => { if (r && r.ok === false && r.error) toast(r.error, 5000); });
+  }, 12);
+}
+function newTab(c, name) {
+  const id = 'c_' + Math.random().toString(36).slice(2, 8);
+  const tabs = tabsOf(c);
+  tabs.push({ id: id, name: name || '终端 ' + (tabs.length + 1) });
+  activateTab(c, id);
+  return id;
+}
+function activateTab(c, id) {
+  setActive(c, id);
+  renderTabBars();
+  const t = tabsOf(c).find((x) => x.id === id);
+  ensureTerm(c);
+  if (c.es) { try { c.es.close(); } catch (e) {} c.es = null; }
+  if (!t) { clearTerm(c); return; }
+  if (c.term) { try { c.term.reset(); } catch (e) { c.term.clear(); } }
+  fitTerm(c);
+  const sz = (c.term && c.term.cols) ? { cols: c.term.cols, rows: c.term.rows } : (c.size || termSize || null);
+  const tmid = S.termMachine || 'local';
+  const q = sz ? `&cols=${sz.cols}&rows=${sz.rows}` : '';
+  const head = tmid === 'local' ? '/api/v1/terminal/' : `/api/v1/machines/${tmid}/terminal/`;
+  const es = new EventSource(`${head}${id}/stream?token=${encodeURIComponent(TOKEN)}${q}`);
+  c.es = es;
+  /* 后端重连时会把历史缓冲重发一遍：先收到 replay 事件就清屏，再收历史 → 不会“输出两遍” */
+  es.addEventListener('replay', () => { if (c.term) { try { c.term.reset(); } catch (e) { c.term.clear(); } } });
+  es.onmessage = (ev) => {
+    let o; try { o = JSON.parse(ev.data); } catch (e) { return; }
+    if (o && o.line != null && c.term) { c.term.write(o.line); if (!c.isDock) scheduleHug(c); }
+  };
+  const cwdEl = $('#termCwd');
+  if (!c.isDock && cwdEl) cwdEl.value = t.cwd || '';
+  if (!c.isDock) c.maxRows = 0;
+  c.hugRows = null; c.retryFor = null;
+  setTimeout(() => { fitTerm(c); if (!c.isDock) hugTerm(c, true); if (!c.isDock && c.term) c.term.focus(); }, 40);
+}
+function clearTerm(c) {
+  if (!c.term) return;
+  try { c.term.reset(); } catch (e) { c.term.clear(); }
+}
+function renderTabBars() {
+  const draw = (c) => {
+    const bar = $(c.barSel);
+    if (!bar) return;
+    bar.innerHTML = tabsOf(c).map((t) => `<span class="ttab ${t.id === activeOf(c) ? 'active' : ''}" data-id="${t.id}" data-which="${c.key}">${esc(t.name)}<i class="ttab-x" data-id="${t.id}" data-which="${c.key}" title="关闭这个终端">✕</i></span>`).join('');
+  };
+  draw(MAIN); draw(DOCK);
+  const tip = $('#dockTip');
+  if (tip) {
+    const n = tabsOf(DOCK).length;
+    tip.textContent = n ? `（${n} 个终端已开）` : '（暂无终端）';
+  }
+  /* 关闭按钮单独绑定：小热区，不用再卡着边算 offsetX */
+  $$('.ttab .ttab-x').forEach((el) => el.onclick = (e) => {
+    e.stopPropagation();
+    const c = CTLS[el.dataset.which] || MAIN;
+    closeTab(c, el.dataset.id);
+  });
+  $$('.ttab').forEach((el) => el.onclick = () => {
+    const c = CTLS[el.dataset.which] || MAIN;
+    activateTab(c, el.dataset.id);
+  });
+}
+function closeTab(c, id) {
+  const rest = tabsOf(c).filter((t) => t.id !== id);
+  setTabs(c, rest);
+  /* 真正释放服务端会话（杀掉 PTY，别留着 bash 占资源）*/
+  try { api(termPathFor(c, id, 'close'), 'POST', {}).catch(function () {}); } catch (e) {}
+  if (activeOf(c) === id) {
+    const next = rest[0] ? rest[0].id : null;
+    setActive(c, next);
+    if (next) activateTab(c, next);
+    else {
+      if (c.es) { try { c.es.close(); } catch (e) {} c.es = null; }
+      /* 抽屉：先让它收起（带过渡动画），稍后再清屏，看起来更顺 */
+      if (c.isDock) collapseDock();
+      const tipTxt = c.isDock ? '＋ 创建终端' : '+ 新建标签';
+      setTimeout(() => {
+        clearTerm(c);
+        if (c.term) c.term.write('\u001b[90m[已关闭全部终端' + (c.isDock ? '，抽屉已收起' : '') + '：点「' + tipTxt + '」重新打开]\u001b[0m\r\n');
+      }, c.isDock ? 200 : 0);
+    }
+  }
+  renderTabBars();
+}
+/* 快捷模板：填进终端（不自动执行），回车再跑 */
+function fillTerm(cmd) {
+  ensureTerm(MAIN);
+  if (!MAIN.term) return;
+  try { MAIN.term.paste(cmd); } catch (e) { termSendRaw(MAIN, cmd); }
+  MAIN.term.focus();
+}
+/* 底部抽屉：展开 / 收起（展开不会自动建终端） */
+/* 底部抽屉占位：按抽屉**实际高度**给主区域留空（避免窄窗口下留不够、内容被压住）*/
+function syncDockSpace() {
+  const d = $('#dock');
+  const m = document.querySelector('main');
+  if (!d || !m) return;
+  if (!document.body.classList.contains('dock-show')) { m.style.paddingBottom = ''; return; }
+  const h = Math.max(44, Math.round(d.getBoundingClientRect().height));
+  m.style.paddingBottom = (h + 14) + 'px';
+}
+function expandDock() {
+  const d = $('#dock'); if (!d) return;
+  d.classList.remove('collapsed');
+  document.body.classList.add('dock-open');
+  const b = $('#dockToggle'); if (b) b.textContent = '收起 ▼';
+  ensureTerm(DOCK);
+  syncDockSpace();
+  setTimeout(syncDockSpace, 230);
+  setTimeout(() => {
+    syncDockSpace();
+    fitTerm(DOCK);
+    if (!tabsOf(DOCK).length) {
+      if (DOCK.term) DOCK.term.write('\u001b[90m[还没有终端：点标题栏的「＋ 创建终端」新建一个]\u001b[0m\r\n');
+    } else if (DOCK.term) DOCK.term.focus();
+  }, 220);
+}
+function collapseDock() {
+  const d = $('#dock'); if (!d) return;
+  d.classList.add('collapsed');
+  document.body.classList.remove('dock-open');
+  const b = $('#dockToggle'); if (b) b.textContent = '展开 ▲';
+  syncDockSpace();
+  setTimeout(syncDockSpace, 230);
+}
+function toggleDock() { const d = $('#dock'); if (!d) return; if (d.classList.contains('collapsed')) expandDock(); else collapseDock(); }
+
+$('#btnNewTab').onclick = () => newTab(MAIN);
+$('#btnTermStop').onclick = () => { if (!activeOf(MAIN)) newTab(MAIN); termSendRaw(MAIN, '\u0003'); toast('已发送 Ctrl-C'); };
+/* 工作目录：真给终端发 cd（提示符里的目录也会同步更新） */
+$('#btnSetCwd').onclick = () => {
+  const p = $('#termCwd').value.trim();
+  if (!p) return;
+  if (!activeOf(MAIN)) newTab(MAIN);
+  termSendRaw(MAIN, "cd '" + p.replace(/'/g, "'\\''") + "'\r");
 };
-$$('.quick').forEach((b) => b.onclick = () => { $('#termInput').value = b.dataset.cmd; $('#termInput').focus(); });
-$('#dockRun').onclick = () => runCmd($('#dockInput').value, $('#dockInput'));
-$('#dockToggle').onclick = (e) => {
+$$('.quick').forEach((b) => b.onclick = () => fillTerm(b.dataset.cmd));
+$('#dockToggle').onclick = (e) => { e.stopPropagation(); toggleDock(); };
+$('#dockHead').onclick = () => toggleDock();
+$('#dockNewTab').onclick = (e) => {
   e.stopPropagation();
-  const d = $('#dock'); d.classList.toggle('collapsed');
-  $('#dockToggle').textContent = d.classList.contains('collapsed') ? '展开 ▲' : '收起 ▼';
+  newTab(DOCK);      /* 新建终端 */
+  expandDock();      /* 同时展开（已展开时只是重新适配尺寸/聚焦）*/
+  toast('已新建终端');
 };
-$('#dockHead').onclick = () => $('#dockToggle').click();
+$('#dockStop').onclick = (e) => { e.stopPropagation(); if (!activeOf(DOCK)) newTab(DOCK); termSendRaw(DOCK, '\u0003'); toast('已发送 Ctrl-C（底部终端）'); };
 
 /* ---------------- 日志 ---------------- */
 async function loadLogs() {
@@ -2220,6 +2414,7 @@ async function loadSettings() {
   const bins = s.toolBins || {};
   $('#sHugoBin').value = bins.hugo || ''; $('#sWdckitBin').value = bins.wdckit || ''; $('#sSeaBin').value = bins.seachest || '';
   $('#sConfirm').checked = !!s.terminal.needConfirm; $('#sBlack').value = (s.terminal.blacklist || []).join(',');
+  if ($('#sGuard')) $('#sGuard').checked = s.terminal.guard !== false;
   const c = s.clean || {};
   $('#cEnabled').checked = c.enabled !== false;
   setEvery('cN', 'cU', c.every, 30, 'minute');
@@ -2507,7 +2702,7 @@ $('#btnSaveSettings').onclick = async () => {
     nodePort: Number($('#sPort').value), defaultLunSize: Number($('#sLun').value), dryRun: $('#sDry').checked,
     toolPaths: { hugo: $('#sHugo').value, wdckit: $('#sWdckit').value, seachest: $('#sSea').value },
     toolBins: { hugo: $('#sHugoBin').value.trim(), wdckit: $('#sWdckitBin').value.trim(), seachest: $('#sSeaBin').value.trim() },
-    terminal: { needConfirm: $('#sConfirm').checked, blacklist: $('#sBlack').value.split(',').map((x) => x.trim()).filter(Boolean) },
+    terminal: { needConfirm: $('#sConfirm').checked, guard: $('#sGuard') ? $('#sGuard').checked : true, blacklist: $('#sBlack').value.split(',').map((x) => x.trim()).filter(Boolean) },
     clean: { enabled: $('#cEnabled').checked, every: getEvery('cN', 'cU', 30, 'minute'), mode: $('#cMode').value, patterns: $('#cPatterns').value.split(',').map((x) => x.trim()).filter(Boolean), systemLogs: $('#cSysLog') ? $('#cSysLog').checked : true, sysLogMaxMB: $('#cSysMB') ? (Number($('#cSysMB').value) || 512) : 512, jobLogKeep: $('#sLogKeep') ? (Number($('#sLogKeep').value) || 80) : 80 },
     syncEnabled: $('#syEnabled').checked, syncEvery: getEvery('syN', 'syU', 1, 'week'),
     disks: Object.assign({}, S.settings && S.settings.disks, { autoRefresh: $('#drEnabled').checked, every: getEvery('drN', 'drU', 6, 'hour') }),
@@ -2672,7 +2867,10 @@ async function boot() {
   hideLogin();
   await loadMachines();
   await loadDisks(true);
-  newTab('终端 1');
+  newTab(MAIN, '终端 1');
+  document.body.classList.add('dock-show');   /* 默认在「硬盘」页 → 底部命令行可见（收起状态）*/
+  ensureTerms();
+  syncDockSpace();
   pollJobs();
   setInterval(pollJobs, 4000);
   setInterval(async () => { const r = await api('/machines'); if (r.machines) { S.machines = r.machines; updateSvc(); } }, 20000);

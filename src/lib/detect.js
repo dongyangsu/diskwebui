@@ -3,6 +3,7 @@
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const brandlookup = require('./brandlookup');
 
 function run(cmd, args, timeout = 15000) {
   return new Promise((resolve) => {
@@ -42,16 +43,70 @@ async function runTool(name, args, timeout) {
 async function has(cmd) { return !!resolveBin(cmd); }
 
 const BRANDS = [
-  { key: '日立/HGST', re: /(HGST|HITACHI|HTS|HUC|HUH|HUS|HDS|HMS|HSH|HE[0-9]{2}|ULTRASTAR)/i },
-  { key: '西数', re: /(WDC|WESTERN DIGITAL|\bWD\d|\bWD[A-Z])/i },
-  { key: '希捷', re: /(SEAGATE|\bST\d{4}|ST[0-9]{4,}|EXOS|BARRACUDA|IRONWOLF)/i },
-  { key: '东芝', re: /(TOSHIBA|MG0[0-9]|MG[0-9]{2}|AL[0-9]{2}|DT0[0-9])/i },
+  /* 2026-09-29 用户口径（必须排在日立之前）：型号里「容量带 T 重复」的是西数盘 —— 6T6T（HUS726T6T…）、8T8T（HUS728T8T…）、10T10T…；
+     以及 WD 自家 Ultrastar 的 WUS/WUH/WD 前缀型号（如 WUS721010=10TB、WUH721212=12TB、WUH721414=14TB）。
+     ⚠️ 纯数字重复（6060 / 8080 / 4040 / 6020 / 6040…）是**日立**的容量码，不能当西数判。 */
+  { key: '西数', re: /(\d{1,2}T)\1|(WDC|WESTERN DIGITAL|\bWD\d|\bWD[A-Z]|\bW(?:US|UH|UC|UD|SH)\d)/i },
+  { key: '日立/HGST', re: /(HGST|HITACHI|HTS|HUA|HUC|HUH|HUS|HDS|HMS|HSH|HE[0-9]{2}|ULTRASTAR)/i },
+  { key: '希捷', re: /(SEAGATE|\bST[0-9]{4,}|EXOS|BARRACUDA|IRONWOLF|SKYHAWK)/i },
+  /* 东芝（2026-09-29 联网核对，证据见 memory）：MG0x/MGxx、ALxx、DT0x 有官方型号表或多方独立来源；
+     MD0x 二手多源可证；HDW[DNE] 多源可证（HDWD=P300 / HDWE=X300 / HDWN=N300）；
+     ⚠️ MN0x 只找到单一来源 → 暂不纳入（用户要求：宁缺勿猜，有证据再加） */
+  { key: '东芝', re: /(TOSHIBA|MG0[0-9]|MG[0-9]{2}|AL[0-9]{2}|DT0[0-9]|MD0[0-9]|HDW[DNE])/i },
 ];
 
 function guessBrand(model, vendor, serial) {
   const s = `${model || ''} ${vendor || ''}`.toUpperCase();
   for (const b of BRANDS) if (b.re.test(s)) return b.key;
   return '其他';
+}
+
+/* 2026-09-29 用户要求（三层判定，防 OEM 改标误判）：
+   第1层=型号规则（见 BRANDS）；第2层=OEM 型号表；第3层=WWN OUI。
+   品牌判不出来或 OEM 型号（如 HP 的 MB2000EBUCF / MB2000JFEML）时，靠 OUI 定厂商最可靠。 */
+const OUI_BRANDS = {
+  'cca': '日立/HGST',      // HGST / Hitachi（0x000CCA，已现场实盘验证）
+  '39': '东芝',            // TOSHIBA CORPORATION（0x000039，sdf 实盘验证）
+  'c50': '希捷',           // Seagate Technology（0x000C50）
+  '14ee': '西数',          // Western Digital Technologies（0x0014EE）
+};
+const OEM_MODELS = {
+  'MB2000EBUCF': '日立/HGST',   // HP OEM 日立 Ultrastar A7K2000 2TB（原厂 HUA723020ALA640）— 2 源验证
+  'MB2000JFEML': '日立/HGST',   // HP/HPE OEM 日立 7K6000 2TB（原厂 HUS726020ALS214）— 用户现场标签
+  'MB6000GEBTP': '日立/HGST',   // HP OEM HGST 6TB SATA 6G（原厂 HUS726060ALA640）；HPE PartSurfer 备件 753873-001 描述尾标 -HGST — 2 源验证
+  'MB2000FAMYV': '希捷',        // HP OEM 希捷 2TB SAS 6G（原厂 ST32000444SS，Constellation ES）— 多源验证
+  'MB6000GVYYU': '希捷',        // HP OEM 希捷 6TB SATA 6G（ST6000NM 系列）；PartSurfer 846508-001 描述尾标 -SGT
+};
+/* HP/HPE 硬盘型号：<2字母前缀><容量GB 4位><后缀>；
+   前缀：MB=3.5" LFF ｜ EG=2.5" SAS 10K ｜ MM=2.5" SATA MDL（EH/MK/MO 证据不足未采纳）
+   后缀首字母≈接口速率：E=SATA 3G ｜ G=SATA 6G ｜ F=SAS 6G ｜ J=SAS 12G（中等可信度，仅用于“接口未知时补位”）
+   ⚠️ 后缀里没有厂商代码（MB2000EBUCF=日立、MB6000GEBTP=HGST、MB2000FAMYV=希捷）→ 判厂商只能靠 OEM 表/备件库/盘自身 INQUIRY */
+function hpModelInfo(model) {
+  const m = String(model || '').trim().toUpperCase();
+  const r = m.match(/^(MB|EG|MM|EH|MK)(\d{4})([EGFJ])/);
+  if (!r) return null;
+  const iface = (r[3] === 'F' || r[3] === 'J') ? 'SAS' : 'SATA';
+  return { form: r[1], capGB: Number(r[2]) || 0, iface, speed: { E: 'SATA 3Gb/s', G: 'SATA 6Gb/s', F: 'SAS 6Gb/s', J: 'SAS 12Gb/s' }[r[3]] };
+}
+function ouiBrand(oui) {
+  if (oui === null || oui === undefined) return null;
+  let hex;
+  if (typeof oui === 'number') hex = oui.toString(16).toLowerCase();
+  else hex = String(oui).toLowerCase().replace(/^0x/, '');
+  hex = hex.replace(/^0+/, '') || '0';
+  return OUI_BRANDS[hex] || null;
+}
+function oemBrand(model) {
+  const m = String(model || '').trim().toUpperCase();
+  if (!m) return null;
+  if (OEM_MODELS[m]) return OEM_MODELS[m];
+  return null;
+}
+/* 从 WWN（例如 0x5000cca0735e7b60）里取 OUI 十六进制串（剔掉 NAA 头位） */
+function ouiFromWwn(wwn) {
+  const s = String(wwn || '').toLowerCase().replace(/^0x/, '');
+  if (s.length < 7) return null;
+  return s.slice(1, 7).replace(/^0+/, '') || '0';
 }
 
 function normInterface(tran, name) {
@@ -208,6 +263,14 @@ async function probeDisk(dev, info) {
     out.smartRaw = (sm2.stdout || sm.stdout || '').slice(0, 4000);
   }
   if (j) Object.assign(out, fromSmartInfo(j));
+  /* WWN / OUI（SAS 盘给 logical_unit_id；SATA 盘给 wwn.oui 十进制） */
+  if (j) {
+    if (j.wwn && typeof j.wwn.oui === 'number') out.wwnOui = j.wwn.oui;
+    else if (j.logical_unit_id) {
+      const h = ouiFromWwn(j.logical_unit_id);
+      if (h) out.wwnOui = parseInt(h, 16);
+    }
+  }
   if (p && (p.health !== '未知' || p.g_list !== null || p.s05 !== null || p.s196 !== null || p.s197 !== null || p.s198 !== null || p.s199 !== null)) {
     out.smartHealth = p.health;
     out.gList = p.g_list;
@@ -239,13 +302,18 @@ async function probeDisk(dev, info) {
   return out;
 }
 
-async function scan() {
+async function scan(opts) {
+  const o = opts || {};
+  let st = o.settings;
+  if (!st) { try { st = require('./store').load('settings'); } catch (e) { st = {}; } }
   const [tree, mounts, hasSmart, hasSg, hasLsscsi] = await Promise.all([
     lsblk(), readMounts(), has('smartctl'), has('sg_inq'), has('lsscsi'),
   ]);
   const disks = [];
   for (const d of tree) {
     if (d.type !== 'disk') continue;
+    /* 2026-09-29 用户要求：伪设备（zram/loop/ram/sr/fd/md/dm-）不放进来混 */
+    if (/^(zram|loop|ram|sr|fd|md\d|dm-)/i.test(d.name || d.kname || '')) continue;
     const children = (d.children || []).map((c) => ({ path: '/dev/' + c.name, type: c.type, mount: (c.mountpoints || [c.mountpoint]).filter(Boolean)[0] || '' }));
     const mounted = children.filter((c) => c.mount).map((c) => c.mount);
     const disk = {
@@ -290,10 +358,60 @@ async function scan() {
     if (!d.autoBrand || d.autoBrand === '其他') {
       const b = guessBrand(d.model, d.vendor, d.serial);
       if (b !== '其他') { d.autoBrand = b; d.brand = b; }
+      else {
+        /* 第2层 OEM 表 → 第3层 WWN OUI → 第4层 本地缓存（含之前联网查过的，标待确认） */
+        const ob = oemBrand(d.model);
+        let b2 = ob || ouiBrand(d.wwnOui);
+        let src = ob ? 'OEM 型号表' : (b2 ? 'WWN OUI' : '');
+        if (!b2) {
+          const c = brandlookup.cacheGet(d.model);
+          if (c && c.brand) { b2 = c.brand; src = '缓存' + (c.confirmed ? '(已确认)' : '(待确认)'); }
+        }
+        if (b2) {
+          d.autoBrand = b2;
+          d.brand = b2;
+          d.brandFromOem = src;
+        } else if (String(d.model || '').trim()) {
+          d.brandPending = true;   // 还有型号但认不出 → 留给“联网兜底”（开了才查）
+        }
+      }
     }
+    /* 2026-09-29：HP/HPE 贴牌盘（MB####/EG####/MM####…）型号里能读出容量/接口；
+       接口不明时用它补位（厂商仍靠 OEM 表/OUI/盘自身 INQUIRY，型号字母里没有厂商码） */
+    d.hpInfo = hpModelInfo(d.model) || null;
+    if (d.hpInfo) {
+      if (!d.interfaceType || d.interfaceType === '其他') { d.interfaceType = d.hpInfo.iface; d.ifaceByHp = d.hpInfo.iface; }
+      if (!d.autoInterface || d.autoInterface === '其他') d.autoInterface = d.hpInfo.iface;
+    }
+    /* 2026-09-29 用户定义：未知盘 = 型号未知、SN 未知（甚至没有容量）的“认不出来的设备”
+       —— 与“缺陷值未知”是两回事 */
+    d.isUnknownDisk = !String(d.model || '').trim() && !String(d.serial || '').trim();
     d.id = d.serial || d.device;
+  }
+  /* 2026-09-29 用户拍板第5层：联网兜底（默认关闭）。只对“认不出且还有型号”的盘、
+     且每次扫描最多查 brandLookup.maxPerScan 个，结果写本地缓存（标待确认）。 */
+  const bl = (st && st.brandLookup) || {};
+  if (bl.enabled) {
+    const lim = Math.max(1, Number(bl.maxPerScan) || 3);
+    let n = 0;
+    for (const d of disks) {
+      if (!d.brandPending || n >= lim) continue;
+      n++;
+      try {
+        const r = await brandlookup.lookupOnline(d.model, Number(bl.timeoutMs) || 6000);
+        if (r && r.brand) {
+          brandlookup.cachePut(d.model, r.brand, r.evidence);
+          d.autoBrand = r.brand;
+          d.brand = r.brand;
+          d.brandFromOem = '联网(待确认)';
+          d.brandPending = false;
+        } else {
+          d.brandLookupFail = (r && r.reason) || '联网无结果';
+        }
+      } catch (e) { d.brandLookupFail = String(e && e.message || e); }
+    }
   }
   return { disks, tools: { smartctl: hasSmart, sg_inq: hasSg, lsscsi: hasLsscsi }, scannedAt: Date.now() };
 }
 
-module.exports = { scan, run, runTool, resolveBin, has, guessBrand, normInterface, ifaceFromProtocol, parseSmart, parseSmartJson, probeDisk };
+module.exports = { scan, run, runTool, resolveBin, has, guessBrand, ouiBrand, oemBrand, ouiFromWwn, hpModelInfo, normInterface, ifaceFromProtocol, parseSmart, parseSmartJson, probeDisk };

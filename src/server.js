@@ -163,7 +163,7 @@ async function remoteJson(machine, tail, method, body, query) {
 }
 
 const PUBLIC = path.join(__dirname, 'public');
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 /* 构建指纹：统一走 lib/build.js 的 compute()（只算固定清单，不含 .bak 等野文件）。
    2026-09-23 修复：此前这里用 readdirSync 把 lib/ 下所有文件（含 .bak 备份）都算进指纹，
    与 lib/build.js compute() 的口径不一致 → 节点与主源 build 永远不相等 →
@@ -504,14 +504,16 @@ async function getDisks(force) {
     if (o) {
       d.brand = o.brand || d.autoBrand;
       d.interfaceType = o.interfaceType || d.autoInterface;
-      d.defectStatusOverride = o.defectStatus || null;
+      /* 2026-09-29 新模型：人工修正 = 「格式化许可」（不干预/允许/禁止）；兼容旧 defectStatus（有→允许） */
+      d.allowOverride = (o.allowFormat !== undefined ? (o.allowFormat || null) : (o.defectStatus === '有' ? '允许' : null));
       d.lunSizeOverride = o.lunSize || null;
     }
     d.id = d.serial || d.device;
     const ev = rules.evaluateDefect(d, settings);
     Object.assign(d, {
       defectMethod: ev.method, autoDefectStatus: ev.autoStatus, defectStatus: ev.status,
-      defectValues: ev.values, defectReason: ev.reason, allowFormat: ev.allow, blockReason: ev.blocked,
+      defectValues: ev.values, defectReason: ev.reason, allowFormat: ev.allow, blockReason: ev.blocked, allowOverride: ev.allowOverride || null,
+      brandUnrecognized: (!d.brand || d.brand === '其他'),
       sizeText: rules.fmtGB(d.sizeBytes),
       recommendedTool: rules.recommendTool(d, settings),
       editable: true,
@@ -1060,7 +1062,7 @@ const handler = async (req, res) => {
         return res.end(t);
       } catch (e) { return json(res, 504, { error: '目标机器不可达：' + String(e.message || e) }); }
     }
-    mm = p.match(/^\/api\/v1\/machines\/([^/]+)\/terminal\/([^/]+)\/(stream|stop|cwd)$/);
+    mm = p.match(/^\/api\/v1\/machines\/([^/]+)\/terminal\/([^/]+)\/(stream|stop|cwd|input|resize|close)$/);
     if (mm) {
       const machine = findMachine(mm[1]);
       if (!machine) return json(res, 404, { error: '机器不存在' });
@@ -1217,8 +1219,8 @@ const handler = async (req, res) => {
         const d = r.disks.find((x) => x.id === decodeURIComponent(mm[1]) || x.device === decodeURIComponent(mm[1]));
         if (!d) return json(res, 404, { error: '硬盘不存在' });
         if (!body.confirm) return json(res, 400, { error: '缺少二次确认（勾选框）', needConfirm: true });
-        /* 硬拦截（系统盘/挂载盘/无缺陷记录）：不可覆盖 */
-        const hardBlock = (d.isSystemDisk && settings.protect.blockSystemDisk) || (d.isMounted && settings.protect.blockMountedDisk) || d.defectStatus === '无';
+        /* 硬拦截（系统盘/挂载盘/未放行）：不可覆盖 */
+        const hardBlock = (d.isSystemDisk && settings.protect.blockSystemDisk) || (d.isMounted && settings.protect.blockMountedDisk) || !d.allowFormat;
         if (hardBlock) return json(res, 403, { error: '该硬盘被规则拦截：' + d.blockReason, blockReason: d.blockReason });
         const rendered = rules.renderCommand(d, body, settings);
         const pf = rules.preflight(d, body, settings, rendered);
@@ -1248,7 +1250,7 @@ const handler = async (req, res) => {
         const results = [];
         const allowed = [];
         for (const d of sel) {
-          const hardBlock = (d.isSystemDisk && settings.protect.blockSystemDisk) || (d.isMounted && settings.protect.blockMountedDisk) || d.defectStatus === '无';
+          const hardBlock = (d.isSystemDisk && settings.protect.blockSystemDisk) || (d.isMounted && settings.protect.blockMountedDisk) || !d.allowFormat;
           if (hardBlock) { results.push({ id: d.id, device: d.device, ok: false, error: d.blockReason || '规则拦截' }); continue; }
           allowed.push(d);
         }
@@ -1306,13 +1308,25 @@ const handler = async (req, res) => {
     mm = p.match(/^\/api\/v1\/terminal\/([^/]+)\/stream$/);
     if (mm) {
       const s = ex.getSession(mm[1]);
+      /* 首次连接：按前端窗口尺寸建 PTY，一次到位（否则会按 80x24 排版错位）*/
+      try { if (!ex.ptyAlive(s)) ex.ensurePty(s, Number(u.query.cols) || 0, Number(u.query.rows) || 0); } catch (e) {}
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       const send = (line) => res.write(`data: ${JSON.stringify({ line })}\n\n`);
+      /* 先发 replay 事件：前端收到先清屏，再收历史缓冲 → 重连不会出现“输出两遍” */
+      res.write('event: replay\n\n');
       for (const line of s.buffer.slice(-300)) send(line);
+      res.write('event: live\n\n');
       s.subs.add(send);
       const hb = setInterval(() => res.write(': hb\n\n'), 15000);
       req.on('close', () => { clearInterval(hb); s.subs.delete(send); });
       return;
+    }
+    /* 真终端：原始按键流 + 窗口自适应 + 关闭会话（2026-09-28）*/
+    mm = p.match(/^\/api\/v1\/terminal\/([^/]+)\/(input|resize|close)$/);
+    if (mm && m === 'POST') {
+      if (mm[2] === 'input') return json(res, 200, ex.termInput(mm[1], body.data, body.size || null));
+      if (mm[2] === 'close') return json(res, 200, { ok: ex.closeSession(mm[1]) });
+      return json(res, 200, ex.termResize(mm[1], body.cols, body.rows));
     }
     mm = p.match(/^\/api\/v1\/terminal\/([^/]+)\/(stop|cwd)$/);
     if (mm && m === 'POST') {

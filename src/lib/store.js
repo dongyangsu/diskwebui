@@ -43,6 +43,13 @@ const DEFAULTS = {
     httpsPort: 8443,
     dryRun: false,                // 用户 2026-09-16 要求：默认关闭 dryRun（真实执行格式化）
     defaultLunSize: 512,
+    /* 2026-09-29 用户拍板：品牌判定四层 + 联网兜底（默认关闭）
+       层级：人工修正 > 型号规则 > OEM 型号表 > WWN OUI > 本地缓存 > 联网查询（开了才查） */
+    brandLookup: {
+      enabled: false,      // 默认关：内网/离线环境必须保持关闭
+      timeoutMs: 6000,     // 单次联网超时
+      maxPerScan: 3,       // 每次扫描最多查几个未识别型号（防拖慢）
+    },
     toolPaths: {
       hugo: '~/hugo-7.4.5.x86_64/',
       wdckit: '~/wdckit-3.0.2.0-x86_64/',

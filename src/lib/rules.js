@@ -63,7 +63,9 @@ function recommendTool(disk, settings) {
   const brand = disk.brand || disk.autoBrand;
   const it = disk.interfaceType || disk.autoInterface;
   const byBrand = TOOLS.filter((t) => t.brand === brand && t.id !== 'custom');
-  if (!byBrand.length) return null;
+  /* 2026-09-29 用户拍板：品牌认不出来时（型号不认 + OEM 表未收录 + OUI 不在表里）的兜底 ——
+     SAS → sg_format（通用 SCSI 格式化，最不挑盘）；SATA → 不给默认，由人工在页面上挑工具 */
+  if (!byBrand.length) return it === 'SAS' ? 'sg_format' : null;
   const exact = byBrand.find((t) => t.interfaceType && t.interfaceType.includes(it) && !t.interfaceType.includes('/'));
   if (exact) return exact.id;
   if (brand === '希捷') return it === 'SAS' ? 'sg_format' : 'seachest';
@@ -84,6 +86,8 @@ function evaluateDefect(disk, settings) {
     if (disk.gList === null || disk.gList === undefined) { autoStatus = '未知'; reason = 'G-list 读取失败' + (disk.smartError ? '：' + disk.smartError : ''); }
     else { values['G-list 值'] = disk.gList; autoStatus = disk.gList > 0 ? '有' : '无'; }
   } else if (it === 'SATA') {
+    /* ⛔ 口径固定（2026-09-29 用户明确，别改别问）：SATA 只看 05/196/197；
+       198(Offline_Uncorrectable) 与 199(UDMA_CRC_Error_Count) 是「可清除」的值，**不算缺陷**。 */
     method = 'SMART 05/196/197';
     const a = disk.smart05, b = disk.smart196, c = disk.smart197;
     values = { '05 重映射扇区': a, '196 重映射事件': b, '197 待映射扇区': c };
@@ -95,15 +99,24 @@ function evaluateDefect(disk, settings) {
     autoStatus = '未知';
     reason = `${it} 接口无对应缺陷判断规则（SAS 看 G-list，SATA 看 05/196/197）`;
   }
-  const status = disk.defectStatusOverride || autoStatus;
+  /* 2026-09-29 用户拍板（新模型，替换旧“人工修正改判定”）：
+     ① 缺陷判定 = 纯自动（只看扫描值），人工修正**不再**改动判定；
+     ② 人工修正改为「格式化许可」：允许格式化 / 禁止格式化 / 不干预，只影响能否格；
+     ③ 未知默认**放行**（未知也参与自动格式化）。 */
+  const status = autoStatus;
+  const ao = disk.allowOverride || null;
   let allow = false, blocked = '';
   const p = settings.protect;
   if (disk.isSystemDisk && p.blockSystemDisk) { blocked = '系统盘/启动盘，默认拦截'; }
   else if (disk.isMounted && p.blockMountedDisk) { blocked = '已挂载盘，默认拦截'; }
+  else if (ao === '禁止') { blocked = '人工修正：禁止格式化'; }
+  else if (ao === '允许') { allow = true; reason = (reason ? reason + '；' : '') + '人工修正：允许格式化'; }
+  /* 2026-09-29 用户定义：未知盘 = 型号/SN（甚至容量）都认不出来的设备 → 不参与自动格式化，默认也拦（可人工允许） */
+  else if (disk.isUnknownDisk) { blocked = '未知盘（型号/序列号识别失败）→ 默认拦截，可人工修正允许'; }
   else if (status === '有') allow = true;
+  else if (status === '未知') { allow = true; reason = (reason ? reason + '；' : '') + '缺陷值未知 → 默认放行'; }
   else if (status === '无') { blocked = '无缺陷记录 → 按规则停止下一次格式化'; }
-  else if (status === '未知') { blocked = p.blockUnknown ? '缺陷状态未知 → 默认禁止（可人工确认覆盖）' : ''; allow = !p.blockUnknown; }
-  return { method, autoStatus, status, values, reason, allow, blocked };
+  return { method, autoStatus, status, values, reason, allow, blocked, allowOverride: ao };
 }
 
 
@@ -342,7 +355,7 @@ function preflight(disk, cfg, settings, rendered) {
   const lun = Number(rendered && rendered.lunSize);
   if (!Number.isFinite(lun) || lun < 512 || lun > 65536) problems.push(`逻辑块大小非法：${(rendered && rendered.lunSize)}（应在 512~65536 之间）`);
   const tid = (rendered && rendered.toolId) || '';
-  if (tid === 'custom' && !String((rendered && rendered.command) || '').trim()) problems.push('自定义命令为空');
+  if (tid === 'custom' && !String((rendered && rendered.command) || '').trim()) problems.push('未识别品牌 / 未选择工具：请人工选择格式化工具（SATA 盘不会自动给默认），或填写自定义命令');
   if ((tid === 'hugo' || tid === 'wdckit') && !fs.existsSync(String(rendered.binPath || ''))) problems.push(`工具可执行文件不存在：${rendered.binPath}`);
   if (tid === 'sg_format' || tid === 'toshiba_sas') {
     try { require('child_process').execFileSync('bash', ['-lc', 'command -v sg_format'], { timeout: 5000 }); }

@@ -181,47 +181,223 @@ function push(s, line) {
   for (const send of s.subs) { try { send(line); } catch (e) {} }
 }
 /* ---------- 真终端：每个标签页一个常驻 PTY shell ----------
-   2026-09-19 用户反馈：“命令行为什么不能像真正的 Linux 那样用”。
-   原因：旧实现每条命令都是 temp `bash -lc`，没有 PTY、没有常驻 shell →
-   vim/top 跑不了、cd / 环境变量不保留。现改为用 `script` 分配伪终端跑一个常驻交互 bash。 */
-function ensureShell(s) {
-  if (s.shell && s.shell.ok && s.shell.proc && !s.shell.proc.killed) return s.shell;
+   2026-09-19：先用 `script` 分配伪终端跑常驻交互 bash（后端有了 PTY）。
+   2026-09-28 重做（用户反馈：网页里的命令行不能用 Tab/Ctrl+C/方向键，不像真终端）：
+     根因 = 前端还是「输入框 + 纯文本 pre」，输出被剥掉 ANSI，按键只在回车时发一次。
+     现在 = 后端用 scripts/ptyshell.py 起真伪终端并**原始字节双向对通**（支持窗口自适应），
+            前端换成内置的 xterm.js 终端模拟器 → Tab 补全 / Ctrl+C / Ctrl+R / 方向键 /
+            vim / top / 颜色 / 光标 / 粘贴多行 / 窗口自适应 全部可用。
+     安全 = 每个会话生成一份 bash rc，用 extdebug 的 DEBUG trap 做命令预拦截（黑名单 + 危险命令），
+            受控入口（/terminal/exec，带二次确认与 dryRun）保持原样。 */
+const PTY_HELPER = path.join(__dirname, '..', 'scripts', 'ptyshell.py');
+let _pyBin;
+/* 找一个能用的 python3（只用标准库 pty/fcntl/termios/select） */
+function pyBin() {
+  if (_pyBin !== undefined) return _pyBin;
+  _pyBin = null;
+  if (!fs.existsSync(PTY_HELPER)) return _pyBin;
+  for (const bin of ['/usr/bin/python3', '/usr/local/bin/python3', '/usr/bin/python', 'python3']) {
+    try {
+      execFileSync(bin, ['-c', 'import pty,fcntl,termios,select,base64,struct'], { stdio: 'ignore', timeout: 5000 });
+      _pyBin = bin; break;
+    } catch (e) {}
+  }
+  return _pyBin;
+}
+/* 危险命令正则（与 /terminal/exec 的二次确认规则保持一致；raw 终端里弹不了窗 → 直接预拦截）。
+   用「词边界」写法，避免误伤路径名（如 cd /home/admin1/hugo-7.4.5.x86_64 不该被拦）。*/
+const DANGER_RE = '(^|[^[:alnum:]_-])(sg_format|seachest|wipefs|mkfs|shred|blkdiscard|hdparm|wdckit|format|hugo)([^[:alnum:]_-]|$)|of=/dev/|>[[:space:]]*/dev/(sd|nvme|sg|hd|vd|disk)';
+function shq(x) { return "'" + String(x).replace(/'/g, "'\\''") + "'"; }
+function termRcPath(s) { return path.join(require('os').tmpdir(), 'dw-term-' + String(s.id).replace(/[^\w.-]/g, '_') + '.sh'); }
+/* 生成会话 rc：PS1 / 历史 / OSC7 目录上报 / 危险命令预拦截 */
+function writeTermRc(s, settings) {
+  const t = (settings && settings.terminal) || {};
+  const black = (t.blacklist || []).map((x) => String(x).toLowerCase()).filter(Boolean);
+  const guard = t.guard !== false;
+  const L = [];
+  L.push('# diskwebui 终端 rc —— 自动生成，请勿手改');
+  L.push('export TERM="${TERM:-xterm-256color}"');
+  L.push('export HISTCONTROL=ignoredups');
+  L.push('export HISTSIZE=2000');
+  L.push('[ -f ~/.bashrc ] && . ~/.bashrc');
+  L.push("export PS1='\\[\\e[32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '");
+  L.push("export PS2='> '");
+  L.push('shopt -s checkwinsize');
+  L.push('__dw_osc7() { printf \'\\033]7;file://%s%s\\007\' "${HOSTNAME:-host}" "$PWD"; }');
+  L.push('PROMPT_COMMAND=__dw_osc7');
+  if (guard) {
+    L.push('# --- 危险命令预拦截（extdebug：DEBUG trap 返回非 0 则不执行该命令）');
+    L.push('#     只检查「敲在提示符上的顶层命令」：补全 / 函数 / 子 shell 内部的命令一律放过，');
+    L.push('#     否则会误伤 bash-completion（如 compopt ... 2> /dev/null 会被当成写盘命令）。');
+    L.push('shopt -s extdebug');
+    L.push("__dw_re='" + DANGER_RE + "'");
+    L.push('__dw_guard() {');
+    L.push('  [ -n "$COMP_LINE" ] && return 0');
+    L.push('  [ "${#FUNCNAME[@]}" -gt 2 ] && return 0');
+    L.push('  [ "${BASH_SUBSHELL:-0}" != "0" ] && return 0');
+    L.push('  local c="$BASH_COMMAND"');
+    L.push('  case "$c" in __dw_*|*__dw_osc7*) return 0;; esac');
+    L.push('  local l="${c,,}"');
+    L.push('  case "$l" in dwconfirm=1\\ *|*" dwconfirm=1 "*) return 0;; esac   # 显式确认后放行');
+    if (black.length) {
+      L.push('  for p in ' + black.map(shq).join(' ') + '; do');
+      L.push('    case "$l" in *"$p"*) printf \'\\033[31m[拦截] 命中黑名单「%s」，未执行：%s\\033[0m\\n\' "$p" "$c" >&2; return 1;; esac');
+      L.push('  done');
+    }
+    L.push('  if [[ "$l" =~ $__dw_re ]]; then');
+    L.push('    printf \'\\033[33m[需确认] 该命令会改动/擦除硬盘数据，已拦截：%s\\033[0m\\n\' "$c" >&2');
+    L.push('    printf \'\\033[33m如需执行：在命令前加 DWCONFIRM=1 回车重发（例：DWCONFIRM=1 sudo sg_format ...）；或在设置页关闭「真终端保护」。\\033[0m\\n\' >&2');
+    L.push('    return 1');
+    L.push('  fi');
+    L.push('  return 0');
+    L.push('}');
+    L.push("trap '__dw_guard' DEBUG");
+  }
+  const f = termRcPath(s);
+  fs.writeFileSync(f, L.join('\n') + '\n', { mode: 0o600 });
+  return f;
+}
+/* 把 pty 原始输出喂给会话：解析 OSC7 同步工作目录，其余原样下发给前端 */
+function ptyFeed(s, d) {
+  if (!s.dec) { try { s.dec = new (require('string_decoder').StringDecoder)('utf8'); } catch (e) { s.dec = null; } }
+  let txt = s.dec ? s.dec.write(d) : d.toString();
+  if (!txt) return;
+  s.oscCarry = (s.oscCarry || '') + txt;
+  /* 取**最后一处** OSC7（第一处是旧目录，用 match 会永远卡在旧值）*/
+  const re = /\u001b\]7;file:\/\/[^/]*(\/[^\u0007\u001b]*)/g;
+  let m, last = null;
+  while ((m = re.exec(s.oscCarry)) !== null) last = m;
+  if (last) { const p2 = String(last[1]).replace(/[\r\n]+$/, ''); if (p2) s.cwd = p2 || '/'; }
+  if (s.oscCarry.length > 4096) s.oscCarry = s.oscCarry.slice(-512);
+  push(s, txt);
+}
+/* 建/取常驻 PTY（首次连接把前端的窗口尺寸带进来，一次到位） */
+function ensurePty(s, cols, rows) {
+  if (s.pty && s.pty.ok && s.pty.proc && !s.pty.proc.killed) {
+    if (cols && rows && (cols !== s.cols || rows !== s.rows)) ptyResize(s, cols, rows);
+    return s.pty;
+  }
+  let settings = {};
+  try { settings = load('settings') || {}; } catch (e) {}
+  let rc = '';
+  try { rc = writeTermRc(s, settings); } catch (e) { rc = ''; }
+  const C = Math.max(20, Math.min(1000, Number(cols) || s.cols || 120));
+  const R = Math.max(5, Math.min(500, Number(rows) || s.rows || 36));
+  s.cols = C; s.rows = R;
+  const cwd = (s.cwd && fs.existsSync(s.cwd)) ? s.cwd : homeDir();
+  const env = Object.assign({}, process.env, { TERM: 'xterm-256color', LANG: process.env.LANG || 'C.UTF-8' });
+  s.pty = { ok: false };
   try {
-    const p = spawn('script', ['-qfc', '/bin/bash -i', '/dev/null'], {
-      cwd: (s.cwd && fs.existsSync(s.cwd)) ? s.cwd : homeDir(),
-      env: Object.assign({}, process.env, {
-        TERM: 'xterm-256color',
-        PS1: '\\[\\e[32m\\]\\u@\\h\\[\\e[0m\\]:\\w\\$ ',
-        PROMPT_COMMAND: '',
-        HISTCONTROL: 'ignoredups',
-      }),
-    });
-    s.shell = { proc: p, ok: true, carry: '' };
-    const onData = (d) => {
-      let txt = (s.shell.carry || '') + d.toString();
-      /* 解析心跳标记：__DWX__<退出码>|<cwd>__ → 更新会话的 cwd/退出码，不让标记显示出来 */
-      txt = txt.replace(/__DWX__([^|]*)\|([^\n]*?)__/g, (m, code, pwd) => {
-        s.lastExit = Number(String(code).trim());
-        const c = String(pwd).replace(/[\r\n]/g, '').trim();
-        if (c) s.cwd = c;
-        return '';
-      });
-      const idx = txt.lastIndexOf('__DWX__');
-      if (idx >= 0 && txt.length - idx < 80) { s.shell.carry = txt.slice(idx); txt = txt.slice(0, idx); }
-      else s.shell.carry = '';
-      if (txt) push(s, txt);
-    };
+    const py = pyBin();
+    let p;
+    if (py) {
+      p = spawn(py, [PTY_HELPER, String(C), String(R), '/bin/bash', rc || ''], { cwd: cwd, env: env });
+      s.ptyMode = 'pty';
+    } else {
+      /* 没有 python3：退回 script（有真 PTY 但窗口尺寸固定，前端会收到 mode=script 提示） */
+      const inner = 'stty rows ' + R + ' cols ' + C + ' 2>/dev/null; exec /bin/bash ' + (rc ? '--rcfile ' + shq(rc) : '') + ' -i';
+      p = spawn('script', ['-qfc', inner, '/dev/null'], { cwd: cwd, env: env });
+      s.ptyMode = 'script';
+    }
+    s.pty = { proc: p, ok: true };
+    const onData = (d) => ptyFeed(s, d);
     p.stdout.on('data', onData);
     p.stderr.on('data', onData);
     p.on('close', () => {
-      if (s.shell) s.shell.ok = false;
-      push(s, '\u001b[90m[shell 已退出，下次执行命令时自动重建]\u001b[0m');
+      if (s.pty) s.pty.ok = false;
+      push(s, '\r\n\u001b[90m[终端已退出，重新连接会自动重建]\u001b[0m\r\n');
     });
   } catch (e) {
-    s.shell = { ok: false, err: e.message };
+    s.pty = { ok: false, err: e.message };
   }
-  return s.shell;
+  return s.pty;
 }
+function ptyAlive(s) { return !!(s.pty && s.pty.ok && s.pty.proc && !s.pty.proc.killed && s.pty.proc.stdin && !s.pty.proc.stdin.destroyed); }
+/* 往 pty 写数据（按键/命令）；helper 模式走 base64 帧，script 模式直接写 */
+function ptyWrite(s, data) {
+  if (!ptyAlive(s)) return false;
+  const str = String(data == null ? '' : data);
+  try {
+    if (s.ptyMode === 'pty') {
+      s.pty.proc.stdin.write('\u0001\u0002IN ' + Buffer.from(str, 'utf8').toString('base64') + '\n');
+    } else {
+      s.pty.proc.stdin.write(str);
+    }
+    return true;
+  } catch (e) { if (s.pty) s.pty.ok = false; return false; }
+}
+function ptyResize(s, cols, rows) {
+  const C = Math.max(20, Math.min(1000, Number(cols) || 120));
+  const R = Math.max(5, Math.min(500, Number(rows) || 36));
+  s.cols = C; s.rows = R;
+  if (!ptyAlive(s)) return false;
+  if (s.ptyMode !== 'pty') return false;   /* script 模式改不了尺寸 */
+  try {
+    s.pty.proc.stdin.write('\u0001\u0002RS ' + C + ' ' + R + '\n');
+    return true;
+  } catch (e) { return false; }
+}
+/* 真正关闭一个终端会话：杀掉它的 PTY + 进程树 + 删掉会话（避免关标签后服务端还挂着 bash） */
+function closeSession(sessionId) {
+  const s = sessions.get(sessionId);
+  if (!s) return false;
+  try { if (s.pty && s.pty.proc && !s.pty.proc.killed) killProcTree(s.pty.proc.pid, s.pty.proc, 'SIGHUP'); } catch (e) {}
+  try { if (s.pty && s.pty.proc && !s.pty.proc.killed) s.pty.proc.kill('SIGKILL'); } catch (e) {}
+  s.pty = null;
+  try { fs.unlinkSync(termRcPath(s)); } catch (e) {}
+  sessions.delete(sessionId);
+  try { appendJSONL('audit.jsonl', { at: Date.now(), kind: 'terminal-close', session: sessionId }); } catch (e) {}
+  return true;
+}
+function killPty(s) {
+  try {
+    if (s.pty && s.pty.proc && !s.pty.proc.killed) {
+      try { if (s.ptyMode === 'pty' && s.pty.proc.stdin) s.pty.proc.stdin.write('\u0001\u0002QT\n'); } catch (e) {}
+      setTimeout(() => { try { if (s.pty && s.pty.proc && !s.pty.proc.killed) killProcTree(s.pty.proc.pid, s.pty.proc, 'SIGHUP'); } catch (e) {} }, 800).unref && null;
+    }
+  } catch (e) {}
+}
+/* 审计：把用户在真终端里敲进去的行记下来（剥掉 ANSI/控制序列） */
+function stripCtl(str) {
+  return String(str)
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, '');
+}
+function recordTyped(s, data) {
+  /* 先按 \r / \n 断行（之前先把控制字符剥干净，\r 被剥掉 → 行永远不完整，审计一条都落不下）*/
+  s.pending = (s.pending || '') + String(data);
+  let idx;
+  while ((idx = s.pending.search(/[\r\n]/)) >= 0) {
+    const line = stripCtl(s.pending.slice(0, idx)).trim();
+    s.pending = s.pending.slice(idx + 1);
+    if (line) {
+      s.history.unshift({ cmd: line, at: Date.now(), cwd: s.cwd, raw: true });
+      s.history = s.history.slice(0, 200);
+      try { appendJSONL('audit.jsonl', { at: Date.now(), kind: 'terminal', cmd: line, cwd: s.cwd, shell: true, raw: true }); } catch (e) {}
+    }
+  }
+  s.pending = stripCtl(s.pending);
+  if (s.pending.length > 4096) s.pending = s.pending.slice(-1024);
+}
+/* 前端入口：原始按键流入 pty */
+function termInput(sessionId, data, sz) {
+  const s = getSession(sessionId);
+  if (!s.pty || !s.pty.ok) ensurePty(s, sz && sz.cols, sz && sz.rows);
+  if (sz && sz.cols && sz.rows) ptyResize(s, sz.cols, sz.rows);
+  if (!ptyAlive(s)) return { ok: false, error: '终端未就绪（服务端无法分配伪终端）', mode: s.ptyMode || null };
+  const wrote = ptyWrite(s, data);
+  if (data) recordTyped(s, data);
+  return { ok: true, wrote: wrote, mode: s.ptyMode || 'pty', n: String(data == null ? '' : data).length };
+}
+function termResize(sessionId, cols, rows) {
+  const s = getSession(sessionId);
+  if (!ptyAlive(s)) ensurePty(s, cols, rows);
+  const ok = ptyResize(s, cols, rows);
+  return { ok: ok, mode: s.ptyMode || null, cols: s.cols, rows: s.rows };
+}
+/* 兼容旧调用点 */
+function ensureShell(s) { return ensurePty(s); }
 function checkPolicy(cmd, settings) {
   const t = settings.terminal;
   const low = cmd.toLowerCase();
@@ -256,14 +432,12 @@ function execInSession(sessionId, cmd, cwd, opts) {
     return { sessionId: s.id, dryRun: true };
   }
 
-  /* 优先走常驻 PTY shell（真终端体验）；不可用才回退为单次 bash -lc */
-  const sh = ensureShell(s);
-  if (sh && sh.ok && sh.proc && sh.proc.stdin && !sh.proc.killed) {
+  /* 优先走常驻 PTY（真终端体验）；不可用才回退为单次 bash -lc */
+  const sh = ensurePty(s);
+  if (sh && sh.ok && ptyAlive(s)) {
     try {
-      sh.proc.stdin.write(cmd + '\n');
-      /* 心跳：上报退出码与当前目录；把字面量拆开写，避免回显的输入行被当成标记 */
-      sh.proc.stdin.write('echo -n "__DW""X__$?|${PWD}__"\n');
-      s.running = sh.proc;
+      ptyWrite(s, cmd + '\n');
+      s.running = s.pty.proc;
       appendJSONL('audit.jsonl', { at: Date.now(), kind: 'terminal', cmd, cwd: s.cwd, shell: true });
       return { sessionId: s.id, shell: true };
     } catch (e) { sh.ok = false; }
@@ -294,9 +468,9 @@ function execInSession(sessionId, cmd, cwd, opts) {
 function stopSession(sessionId) {
   const s = sessions.get(sessionId);
   if (!s) return false;
-  /* 常驻 shell：直接送 Ctrl-C，等价于在真终端里按 ^C */
-  if (s.shell && s.shell.ok && s.shell.proc && s.shell.proc.stdin) {
-    try { s.shell.proc.stdin.write('\u0003'); push(s, '\u001b[33m[已发送 Ctrl-C]\u001b[0m'); return true; } catch (e) {}
+  /* 常驻 PTY：直接送 Ctrl-C，等价于在真终端里按 ^C */
+  if (ptyAlive(s)) {
+    try { ptyWrite(s, '\u0003'); push(s, '\u001b[33m[已发送 Ctrl-C]\u001b[0m'); return true; } catch (e) {}
   }
   if (!s.running) return false;
   try { process.kill(-s.running.pid, 'SIGTERM'); } catch (e) { try { s.running.kill('SIGTERM'); } catch (e2) {} }
@@ -348,7 +522,7 @@ function newJob(disk, cfg, rendered, settings, extra) {
     at: Date.now(), kind: 'format', jobId: id, device: job.device, devices: job.devices, isBatch: job.isBatch, serial: disk.serial,
     brand: disk.brand, interfaceType: disk.interfaceType, lunSize: rendered.lunSize,
     tool: rendered.toolId, mode: rendered.mode, command: rendered.command, cwd: rendered.cwd,
-    dryRun: !!settings.dryRun, override: !!disk.defectStatusOverride,
+    dryRun: !!settings.dryRun, override: !!(disk.allowOverride || disk.defectStatusOverride),
   });
   /* 命令为空保护：空命令会让 bash 立即退出 0 → 假成功 */
   if (!String(job.command || '').trim()) {
@@ -1319,6 +1493,8 @@ function stopJob(id) {
 }
 
 module.exports = { sessions, newSession, getSession, execInSession, stopSession, jobs, newJob, stopJob, pub, checkPolicy, setFinishHook,
+  /* 2026-09-28 新增：真终端（xterm.js ↔ 原始 PTY 字节流） */
+  termInput, termResize, ensurePty, ptyWrite, ptyResize, ptyAlive, killPty, writeTermRc, closeSession,
   /* 2026-09-17 新增：常驻工具会话 / 任务存盘 / 排对列 */
   toolSessions, getToolSession, ensureToolSession, sendToolCmd, quitToolSession, sessionText, scheduleIdleQuit,
   queues, saveRegistry, loadRegistry, moveOutOfServiceCgroup, pidAlive, JOB_LOG_DIR, sweepJobLogs, JOB_LOG_MAX_BYTES, adoptJobs, attachExistingSessions, interruptToolSession, stopAll,

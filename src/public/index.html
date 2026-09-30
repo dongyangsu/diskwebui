@@ -3,14 +3,15 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>硬盘检测与格式化 · Web 管理界面 V0.3</title>
+<title>硬盘检测与格式化 · Web 管理界面 V0.4</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext y='50' font-size='52'%3E%F0%9F%9B%A0%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="topbar">
   <div class="toprow">
-    <div class="brand">🛠 硬盘检测与格式化 <span class="ver">V0.3</span></div>
+    <div class="brand">🛠 硬盘检测与格式化 <span class="ver">V0.4</span></div>
 
     <div class="machine-pick">
       <label>当前机器</label>
@@ -166,14 +167,9 @@
         <input id="termCwd" style="width:230px" placeholder="/home/admin1/hugo-7.4.5.x86_64/">
         <button class="btn small" id="btnSetCwd">切换</button>
       </div>
-      <pre id="termOut" class="termout"></pre>
-      <div class="termline">
-        <span id="termPrompt" class="prompt">$</span>
-        <input id="termInput" placeholder="输入命令，回车执行（支持管道/批量；如 seq 4 35 | xargs -I{} -P 0 sudo sg_format -v --format --size=512 /dev/sg{}）">
-        <button class="btn primary" id="btnRun">执行</button>
-      </div>
+      <div id="termHost" class="termhost"></div>
       <div class="row">
-        <span class="muted small">快捷：</span>
+        <span class="muted small">快捷填入（点一下填进终端，回车再执行）：</span>
         <button class="btn small quick" data-cmd="lsblk -o NAME,SIZE,MODEL,SERIAL,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS">lsblk 盘列表</button>
         <button class="btn small quick" data-cmd="sudo sg_format -v --format --size=512 /dev/sg2">sg_format 单盘</button>
         <button class="btn small quick" data-cmd="seq 4 35 | xargs -I{} -P 0 sudo sg_format -v --format --size=512 /dev/sg{}">sg_format 批量</button>
@@ -251,7 +247,8 @@
           <label class="f">SeaChest 目录 <input id="sSea"> <button class="btn small" data-pick="seachest">📁 浏览…</button></label>
           <label class="f">SeaChest 可执行文件 <input id="sSeaBin"></label>
           <h3>命令行安全</h3>
-          <label class="f check"><input type="checkbox" id="sConfirm"> 危险命令需二次确认</label>
+          <label class="f check"><input type="checkbox" id="sConfirm"> 危险命令需二次确认（受控执行通道）</label>
+          <label class="f check"><input type="checkbox" id="sGuard"> 真终端保护：危险命令预拦截（取消勾选 = 终端里可以直执行任何命令）</label>
           <label class="f">黑名单（逗号分隔） <input id="sBlack"></label>
           <h3>版本同步（以主服务器为准，开机自动补齐最新代码）</h3>
           <label class="f check"><input type="checkbox" id="auEnabled"> 启用自动同步更新（离线机器开机后自动更新）</label>
@@ -327,19 +324,21 @@
 <!-- ============ 顶部命令行抽屉 ============ -->
 <div id="dock" class="dock collapsed">
   <div class="dockhead" id="dockHead">
-    <b>⌨ 命令行（多开/多标签）</b>
-    <span id="dockStatus" class="muted small"></span>
+    <b>⌨ 命令行</b>
+    <button class="btn small primary" id="dockNewTab">＋ 创建终端</button>
+    <span id="dockTip" class="muted small"></span>
     <div class="spacer"></div>
+    <span class="muted small">Tab 补全 · Ctrl+C · Ctrl+R · 方向键 · vim</span>
     <button class="btn small" id="dockToggle">展开 ▲</button>
   </div>
   <div class="dockbody">
-    <div class="termtabbar" id="dockTabs"></div>
-    <pre id="dockOut" class="termout small"></pre>
-    <div class="termline">
-      <span class="prompt">$</span>
-      <input id="dockInput" placeholder="示例：usb 路径下调用 hugo 内的 format…">
-      <button class="btn primary small" id="dockRun">执行</button>
+    <div class="termtabs docktabs">
+      <div class="termtabbar" id="dockTabs"></div>
+      <button class="btn small" id="dockStop">停止命令</button>
+      <div class="spacer"></div>
+      <span class="muted small">与「命令行」页各自独立，互不影响</span>
     </div>
+    <div id="dockTerm" class="termhost dockhost"></div>
   </div>
 </div>
 
@@ -456,7 +455,7 @@
         <li>检测到缺陷自动排队格式化・完成后自动复检续轮</li>
         <li>多机统一管理・版本与时间自动同步</li>
       </ul>
-      <div class="lver">V0.3</div>
+      <div class="lver">V0.4</div>
     </div>
     <div class="login-right">
       <h2>用户登录</h2>
@@ -471,6 +470,9 @@
     </div>
   </div>
 </section>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="vendor/addon-web-links.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

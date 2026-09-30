@@ -47,7 +47,7 @@ code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-family:var(--mono
 .btn.small{padding:3px 9px;font-size:12px;}
 .topbar .btn.primary, .dock .btn{background:var(--blue);border-color:var(--blue);color:#fff;}
 
-main{padding:14px;max-width:none;flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;}
+main{padding:14px;max-width:none;flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;}
 .view{display:none;}
 .view.active{display:block;height:100%;min-height:0;overflow:auto;}
 /* 机器管理页：整页不滚，表格自己横向/纵向滚动（2026-09-24 用户要求） */
@@ -136,6 +136,16 @@ main{padding:14px;max-width:none;flex:1;min-height:0;overflow:hidden;display:fle
 .log,.termout{background:#0b1220;color:#cbd5e1;font-family:var(--mono);font-size:12px;line-height:1.55;margin:0;padding:10px 12px;overflow:auto;white-space:pre-wrap;word-break:break-all;}
 .log{height:calc(100vh - 420px);min-height:200px;border-radius:0 0 12px 12px;}
 .termout{height:52vh;min-height:260px;}
+/* 真终端容器（xterm.js）*/
+.termhost{height:52vh;min-height:260px;background:#0b1220;padding:6px 8px;overflow:hidden;}
+.termhost .xterm{height:100%;}
+.termhost .xterm-viewport{background:#0b1220 !important;}
+/* 命令行页：终端可以缩，工具栏/标签栏不能被挤掉（窄窗口适配）*/
+#view-terminal .termpanel{flex:1;display:flex;flex-direction:column;min-height:0;}
+#view-terminal .termtabs{flex:0 0 auto;}
+#view-terminal .termhost{flex:1 1 auto;min-height:min(110px,16vh);height:auto;}
+#view-terminal .row{flex:0 0 auto;flex-wrap:wrap;}
+#view-terminal.view.active{display:flex;flex-direction:column;overflow:auto;}
 .termout.small{height:180px;min-height:120px;}
 
 /* 面板/表格 */
@@ -196,10 +206,34 @@ label.f.check{display:flex;align-items:center;gap:8px;}
 .prompt{font-family:var(--mono);color:var(--green);font-weight:700;}
 
 /* 抽屉 */
-.dock{position:fixed;left:0;right:0;bottom:0;background:#111827;color:#e5e7eb;border-top:2px solid var(--blue);z-index:30;}
-.dock.collapsed .dockbody{display:none;}
+.dock{position:fixed;left:0;right:0;bottom:0;background:#111827;color:#e5e7eb;border-top:2px solid var(--blue);z-index:30;display:none;}
+/* 只在硬盘页显示底部命令行；展开时给主区域留出空间，不再挡住内容 */
+body.dock-show .dock{display:block;}
+body.dock-show main{padding-bottom:56px;}
+body.dock-show.dock-open main{padding-bottom:310px;}
+main{transition:padding-bottom .18s ease;}   /* 具体数值由 JS 按抽屉实际高度校准（syncDockSpace）*/
 .dockhead{display:flex;align-items:center;gap:10px;padding:7px 14px;cursor:pointer;}
-.dockbody{padding:0 12px 12px;}
+/* 收起/展开用 max-height 过渡，不要 display:none，否则会“啪”一下跳 */
+.dockbody{height:min(250px,calc(100vh - 300px));max-height:min(250px,calc(100vh - 300px));padding:6px 12px 10px;display:flex;flex-direction:column;gap:6px;overflow:hidden;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;}
+.dock.collapsed .dockbody{max-height:0;min-height:0;padding-top:0;padding-bottom:0;opacity:0;}
+.dock.collapsed .dockbody{max-height:0;padding-top:0;padding-bottom:0;opacity:0;}
+.dockhost{flex:1;min-height:0;height:auto;}
+/* 抽屉里的标签条（深色底，和终端一套）*/
+.dock .docktabs{background:transparent;border-bottom:1px solid #1f2937;padding:0 0 6px;}
+.dock .ttab{background:#1f2937;color:#e5e7eb;border-color:#374151;}
+.dock .ttab.active{background:var(--blue);border-color:var(--blue);color:#fff;}
+/* 标签上的关闭按钮：单独一个小热区，不用再卡着边算 offsetX */
+.ttab .ttab-x{display:inline-block;margin-left:6px;padding:0 3px;border-radius:4px;font-style:normal;opacity:.6;cursor:pointer;}
+.ttab .ttab-x:hover{background:rgba(239,68,68,.85);color:#fff;opacity:1;}
+
+@media (max-width:820px){
+  /* 窄窗口：命令行页工具栏压缩，避免换行把终端/快捷按钮挤出去 */
+  #view-terminal .termtabs{padding:6px 8px;gap:6px;font-size:12px;}
+  #view-terminal .termtabs label{display:none;}
+  #view-terminal #termCwd{width:120px !important;}
+  #view-terminal .row{gap:6px;font-size:12px;}
+  #view-terminal .row .muted{display:none;}
+}
 
 /* 弹窗 */
 .modal{position:fixed;inset:0;background:rgba(15,23,42,.6);display:flex;align-items:center;justify-content:center;z-index:50;}

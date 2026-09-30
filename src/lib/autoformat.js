@@ -97,7 +97,9 @@ async function tick(exec, opts) {
       if (o) {
         if (o.brand) d.brand = o.brand;
         if (o.interfaceType) d.interfaceType = o.interfaceType;
-        if (o.defectStatus) d.defectStatusOverride = o.defectStatus;
+        /* 2026-09-29 新模型：人工修正 = 「格式化许可」（兼容旧 defectStatus：有→允许） */
+        const ao = o.allowFormat !== undefined ? o.allowFormat : (o.defectStatus === '有' ? '允许' : null);
+        if (ao) d.allowOverride = ao;
       }
       if (d.isSystemDisk) { logThrottled('autoformat-skip', sn, 'sys', { device: d.device, reason: '系统盘' }); continue; }
       if (d.isMounted) { logThrottled('autoformat-skip', sn, 'mnt', { device: d.device, reason: '已挂载' }); continue; }
@@ -128,10 +130,11 @@ async function tick(exec, opts) {
       }
 
       const ev = rules.evaluateDefect(d, st);
-      if (ev.status !== '有') {
+      /* 2026-09-29 用户要求：未知也放行并参与自动格式化 → 这里改判「是否放行」 */
+      if (!ev.allow) {
         const fl0 = loadFails();
-        if (fl0[sn]) { delete fl0[sn]; saveFails(fl0); }   // 已无缺陷 → 清零失败计数
-        logThrottled('autoformat-skip', sn, 'nodefect', { device: d.device, reason: '无缺陷记录', defect: ev.status }, 3600000);
+        if (fl0[sn]) { delete fl0[sn]; saveFails(fl0); }   // 已不放行 → 清零失败计数
+        logThrottled('autoformat-skip', sn, 'nodefect', { device: d.device, reason: ev.blocked || '未放行', defect: ev.status }, 3600000);
         continue;
       }
       /* 连续失败到上限 → 搁置，不再重排（防止 round 149 这种死循环） */
