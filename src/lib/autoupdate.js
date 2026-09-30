@@ -82,6 +82,19 @@ function applyBundle(tgzBuf, masterBuild, log) {
   execSync(`tar xzf ${JSON.stringify(path.join(stage, 'bundle.tar.gz'))} -C ${JSON.stringify(stage)}`, { timeout: 60000 });
   const files = build.fileList(stage);
   for (const f of files) if (!fs.existsSync(path.join(stage, f))) throw new Error('包不完整，缺 ' + f);
+  /* 2026-09-30：除了清单，**把包里实际存在的源码文件全部拷过去**（双保险）。
+     原因：老版本节点的清单可能不认识新增文件，会“漏拷 → 启动即崩”（.59 实测过）。 */
+  const copyList = files.slice();
+  (function walk(d, rel) {
+    let ents = [];
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of ents) {
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (/^\.git$|\.bak/i.test(e.name)) continue;
+      if (e.isDirectory()) walk(path.join(d, e.name), r);
+      else if (copyList.indexOf(r) < 0) copyList.push(r);
+    }
+  })(stage, '');
   /* 语法校验（用 node 自检，避免推半截包把服务打挂） */
   try { execSync(`${process.execPath} --check ${JSON.stringify(path.join(stage, 'server.js'))}`, { timeout: 20000 }); }
   catch (e) { throw new Error('新代码语法校验失败，已放弃本次更新'); }
@@ -89,7 +102,7 @@ function applyBundle(tgzBuf, masterBuild, log) {
   const bak = path.join(os.tmpdir(), 'disk_webui.bak-' + Date.now());
   try { execSync(`mkdir -p ${JSON.stringify(bak)} && tar czf - -C ${JSON.stringify(APP_DIR)} --exclude=data --exclude=tls . | tar xzf - -C ${JSON.stringify(bak)}`, { timeout: 60000 }); } catch (e) {}
   /* 覆盖（data/ 与 tls/ 不动） */
-  for (const f of files) {
+  for (const f of copyList) {
     const dst = path.join(APP_DIR, f);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     fs.copyFileSync(path.join(stage, f), dst);

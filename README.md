@@ -73,6 +73,7 @@
 ### 四、其他改动
 - **删除**命令行页的「受控执行」输入行与底部抽屉的纯文本输出/「执行」按钮（危险命令统一走终端内预拦截；受控执行通道保留在设置里）
 - 新增文件：`src/lib/brandlookup.js`、`src/scripts/ptyshell.py`、`src/scripts/release_checklist.md`、`src/public/vendor/`（xterm 及其插件）
+- **修复同步地雷**：`build.js` 同步文件清单补齐 `lib/brandlookup.js` 与 `public/vendor/*`（漏列会导致节点同步漏拷、启动即崩），`autoupdate.js` 更新包改为全量覆盖，`detect.js` 对兜底模块改为可选加载
 - **回归测试**：`src/scripts/ui_suite.mjs`（65 项断言）在 HTTP 与 HTTPS 两种入口均通过；发布前按 `scripts/release_checklist.md` 走一遍
 - **运行环境**：Ubuntu 24.04 + Node.js v26 实测；HTTP(8090) 与 HTTPS(8443 自签) 两种入口均验证
 

@@ -3,7 +3,11 @@
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const brandlookup = require('./brandlookup');
+/* 联网兜底模块为「可选」：缺失时降级为空实现，**保证服务仍能启动**
+   （2026-09-30 教训：节点自动同步若漏拷本模块，硬 require 会让服务崩溃循环） */
+let brandlookup;
+try { brandlookup = require('./brandlookup'); }
+catch (e) { brandlookup = { cacheGet: () => null, cachePut: () => {}, lookupOnline: async () => null }; }
 
 function run(cmd, args, timeout = 15000) {
   return new Promise((resolve) => {
